@@ -1,3 +1,5 @@
+![Star Successor Recomp](StarSuccessorRecomp_Logo.png)
+
 # Star Successor Recompiled
 
 ### v0.2 · Experimental Windows x64 release based on the v20 milestone
