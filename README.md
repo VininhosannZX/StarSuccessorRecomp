@@ -1,12 +1,22 @@
 # Star Successor Recompiled
 
-### v20 · Experimental Windows x64 milestone
+### v0.2 · Experimental Windows x64 release based on the v20 milestone
 
 An unofficial native PC port of **Sin and Punishment: Star Successor**, using the **Wiicompiled** static translator and a **wiikit-derived** runtime for graphics, audio, input and Wii services.
 
 **The v20 build has been reported working on the dedicated-GPU PC below. Only the first stage has been tested. Audio is not 100% correct. Intel integrated graphics are currently unsupported.**
 
 This is a development milestone, not a finished release or a claim that the entire game is playable. It is not affiliated with Nintendo, Treasure, WiiCompiled or the wiikit authors.
+
+## AI assistance
+
+This project was developed by VininhosannZX with assistance from
+OpenAI's ChatGPT for code generation, debugging, documentation and
+test planning.
+
+AI-generated contributions may contain errors. Human testing and review
+remain necessary. Testing of this milestone has been limited to the
+first stage of the game.
 
 ## Milestone status
 
@@ -41,6 +51,12 @@ These are the owner's reported test specifications, **not minimum requirements**
 
 Windows rendering on this machine is owner-reported. Local development tests also rendered the first stage on Linux/Mesa software rendering; those tests do not establish Windows GPU compatibility or performance. See [hardware notes](docs/HARDWARE.md).
 
+## Downloading the Windows release
+
+On this repository’s GitHub page, open **Releases** and select **v0.2** once the owner has published it. Download **StarSuccessor_Windows_v0.2.zip**, extract it to a writable folder, and run **StarSuccessor.exe**. The standalone EXE can also run, but the ZIP includes the notices, controls and build identity.
+
+**v0.2 packages the exact v20 executable reported working by the owner. It does not introduce new gameplay, audio or Intel-compatibility fixes.** The Windows EXE’s embedded file-version metadata has not been rewritten.
+
 ## What this repository contains
 
 This source package preserves **v20**, before the subsequent v21/v22 renderer experiments. The renderer files are identical to the archived v20 sources; their hashes and the original private executable identity are in [MILESTONE_V20.json](MILESTONE_V20.json).
@@ -56,11 +72,11 @@ This source package preserves **v20**, before the subsequent v21/v22 renderer ex
 | `docs/` | Build instructions, troubleshooting, publication checklist and scope |
 | `licenses/`, `LICENSE` | Component notices and licenses |
 
-**No disc image, extracted executable sections, translated game-function sources, game textures/audio, build cache or game-containing EXE is included.** Generate private build inputs from your own supported USA disc image. A clean clone is a source checkpoint, not a ready-to-play download.
+**No disc image, extracted executable sections, translated game-function sources, game textures/audio, build cache or game-containing EXE is included.** Generate private build inputs from your own supported USA disc image. A clean source clone is not the Windows release package; use the separate release asset described above or build locally.
 
-## Running your local v20 executable
+## Running v0.2 / the local v20 executable
 
-If you already have the private v20 build, keep it outside the public repository:
+The release uses the same executable as the archived v20 build:
 
 1. Extract its complete package to a writable folder.
 2. Start `StarSuccessor.exe` or `Jogar-OpenGL.bat`.
@@ -71,7 +87,7 @@ If you already have the private v20 build, keep it outside the public repository
 
 OpenGL 4.5 and a compatible graphics driver are required. The archived EXE statically links SDL3 and Zstandard; Python and .NET are build dependencies, not requirements for running that EXE.
 
-The private EXE embeds game-derived sections and translated game code. **Do not upload it, generated C++ or its build cache to this public repository or a GitHub Release.** A future local installer/recompiler would be needed for convenient source-only distribution. See [publication checklist](docs/PUBLISHING.md).
+The private EXE embeds game-derived sections and translated game code. Selecting an ISO at runtime does **not** make this a game-data-free executable. v0.2 is a release label for the existing binary, not a new clean recompiler/installer. Keep disc images, extracted files, translated game C++ and build caches out of the source repository. See [publication notes](docs/PUBLISHING.md).
 
 ## Controls
 
