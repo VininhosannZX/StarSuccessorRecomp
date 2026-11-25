@@ -1,0 +1,30 @@
+{
+  "818A646C": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "8199C5FC": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "81A1AE98": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "81ACA7C0": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "81AE38A0": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "81BEB9D4": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  },
+  "81E904D4": {
+    "max_instructions": 65536,
+    "max_bytes": 262144
+  }
+}

@@ -1,0 +1,132 @@
+// wiikit runtime — what the runtime's own files share (not seen by recompiled code).
+#pragma once
+#include "bridge_ppc.h"
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
+#include <functional>
+#include <string>
+
+// ---- core.cpp ---------------------------------------------------------------------------
+PPCFunc ppc_lookup(uint32_t addr);
+// The EFB read by the CPU (0xC8000000): the command processor's (gx.cpp), when there is one.
+extern uint32_t (*g_efb_peek)(uint32_t addr);
+// Optional: a symbols.tsv (python -m wiikit.dol GAME.elf --symbols) names
+// guest addresses in logs and crash reports.
+void rt_load_symbols(const char* tsv);
+std::string rt_name(uint32_t addr);               // "func+0x12", or the hex address
+[[noreturn]] void rt_die(const char* fmt, ...);
+void rt_log(const char* fmt, ...);                 // stderr, one line
+// The guest call chain from a context: LR, then the saved LRs up the back chain.
+void rt_backtrace(const PPCContext& c, FILE* out, int max = 24);
+
+// A port's own layer: code linked into wiiboot next to the runtime (the
+// project's WIIKIT_EXTRA adds it) registers an install function with a
+// static RtGameLayer; wiiboot runs it after the runtime's own hooks, before
+// the game starts. Its hooks come from the recompiler's --hooks file.
+struct RtGameLayer { RtGameLayer(const char* name, void (*install)()); };
+void rt_game_install();
+
+// ---- rso.cpp ----------------------------------------------------------------------------
+// RSO modules: the run-time address of a loaded module's code -> the virtual
+// one it was recompiled at (0 if no module is there); the module a virtual
+// address is in.
+uint32_t rso_virtual(uint32_t addr);
+const RsoModule* rso_module_at(uint32_t vaddr);
+void rso_install();                                // RSOLinkListFixed / RSOUnLinkList hooks
+
+// Registers of the guest code currently running on this host thread (for
+// crash reports and "who touched this register" logs). Set by the OS layer.
+extern thread_local PPCContext* t_ppc;
+
+// ---- guest memory from the host side -----------------------------------------------------
+static inline uint32_t virt(uint32_t phys) { return phys | 0x80000000u; }  // MEM1 and MEM2
+static inline uint8_t* host(uint32_t guest) {
+    return Memory::GetPointer(guest);
+}
+std::string guest_cstr(uint32_t addr, size_t max = 256);
+
+// ---- the console ---------------------------------------------------------------------------
+// A GameCube disc (boot.cpp decides, from the disc header's magic) runs on
+// the Wii's older self: no IOS or MEM2, 16 MB of ARAM, the disc drive, the
+// controllers and the memory cards at their registers, and a 162 MHz bus
+// (the Wii's is 243 MHz). The time base counts at a quarter of the bus.
+extern bool g_gamecube;
+extern uint32_t g_bus_mhz;                        // 243 on the Wii, 162 on the GameCube
+static inline uint64_t tb_hz() { return (uint64_t)g_bus_mhz * 250000; }
+
+// ---- the OS layer (os.cpp) --------------------------------------------------------------
+void os_report_running(int depth);                // stderr: where the running guest thread is, and the parked ones
+void os_install();                                // hooks, time
+void os_start_main(uint32_t entry);               // run __start on a guest host thread, and return
+void os_raise();                                  // a device changed its interrupt line
+uint64_t os_tb_now();                             // guest time base now
+void os_watch(int seconds);                       // report the running thread periodically
+void os_profile();                                // WIIKIT_PROFILE: sample the guest code (=render: the renderer), list the hot functions
+
+// ---- GX (gx.cpp) -----------------------------------------------------------------
+void gx_init();                                   // after video_configure
+void gx_report();                                 // command stream statistics
+void gx_trace_next_frame();                       // the next frame's commands to gxtrace_N.txt (F12)
+void gx_submit_pending();                         // after a burst, outside g_hw: hand the record to the renderer
+// An EFB copy to texture, written into RAM in its texture format: for a
+// game that reads the copy on the CPU (the renderer otherwise keeps copies
+// on the host GPU only). False if no copy was made to addr (physical).
+bool gx_copy_to_ram(uint32_t addr);
+void gx_draw_done_reached();                      // the renderer: the game's draw-done point is drawn
+void hw_run_locked(const std::function<void()>& fn);   // run fn holding the hardware lock
+
+// ---- the hardware (hw.cpp) -----------------------------------------------------------
+void hw_init();
+void hw_vi_preset(bool pal);                        // VI as the IPL leaves it
+bool hw_load_fonts(const char* dir);               // font_japanese.bin, font_western.bin
+bool hw_external_pending();                        // PI cause & mask
+void hw_vi_retrace();                              // called at each vertical retrace
+std::chrono::nanoseconds hw_vi_field_period();     // from the timing VI is programmed with
+std::chrono::steady_clock::time_point hw_tick();   // timed device events; returns the next one
+extern bool g_mmio_log;                            // log every first access to a register
+
+// ---- the Wii Remote (wpad.cpp) -------------------------------------------------------
+void wpad_install();                               // WPAD/KPAD hooks
+// KPADStatus's size in the game's SDK (KPADRead fills whole samples): 0xF0
+// by default; the SDKs of 2006-07 have 0x84. The fields up to 0x5F agree.
+void wpad_set_kpad_status_size(uint32_t size);
+// The game plays with the Classic Controller: each channel's Remote holds
+// one where video.cpp has one (video_classic), and says so to the game's
+// connect and extension callbacks. A port's filter may change what a
+// channel's Classic reports before the game reads it (the mouse on a stick);
+// on the GameCube it filters the controllers on SI, which read the same state.
+struct ClassicState;
+using WpadClassicFilter = void (*)(int chan, ClassicState& s);
+void wpad_set_classic(bool on);
+// A game that plays with the Remote and the Nunchuk: one on channel 0.
+void wpad_set_nunchuk(bool on);
+void wpad_set_classic_filter(WpadClassicFilter f);
+void wpad_filter_classic(int chan, ClassicState& s);  // the port's filter, if it has one
+
+// ---- audio (ax.cpp, audio.cpp) --------------------------------------------------------
+void ax_command_list(uint32_t addr);               // the AX micro-code: mix one frame
+uint8_t aram_read(uint32_t addr);                  // the GameCube's ARAM (hw.cpp), where its AX reads samples
+bool ax_load_coefs(const char* dir);               // dsp_coef.bin: the polyphase resampler's table
+void audio_init(bool enabled);                     // the host's audio device (SDL3); false: none
+// A block the AI DMA starts playing: frames of big-endian 16-bit stereo,
+// right then left, as the Wii's AI reads them.
+void audio_play(const uint8_t* be_rl, uint32_t frames, uint32_t rate);
+
+// ---- SYSCONF (sysconf.cpp) -----------------------------------------------------------
+// Writes the NAND's /shared2/sys/SYSCONF if it has none, sets what the
+// options ask (-1: as the file says), and says whether the console is 16:9.
+struct SysconfOptions { int aspect = -1; int language = -1; };   // IPL.AR 0/1, IPL.LNG 0..6
+bool sysconf_prepare(const char* nand_root, const SysconfOptions& o);
+extern bool g_sysconf_eurgb60;                     // IPL.E60, after sysconf_prepare: PAL consoles may use 60 Hz
+
+// ---- IOS (ios.cpp) ------------------------------------------------------------------
+void ios_init(const char* disc_root, const char* nand_root);
+void ios_ipc_write(uint32_t reg, uint32_t v);      // 0xCD000000-0xCD00000C
+uint32_t ios_ipc_read(uint32_t reg);
+void ios_irq_flag_clear(uint32_t v);               // 0xCD000030
+void ios_irq_mask_write(uint32_t v);               // 0xCD000034
+uint32_t ios_irq_flags();
+uint32_t ios_irq_mask();
+std::chrono::steady_clock::time_point ios_tick();  // replies now due delivered; when the next is
+void hw_cpu_idle();                               // the processor idles: IOS replies are due at once

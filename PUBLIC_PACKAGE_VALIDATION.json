@@ -1,0 +1,11 @@
+{
+  "public_tree_omission_check": "passed",
+  "python_syntax": "passed",
+  "private_input_preparation": "passed",
+  "analysis_image_matches_prior_workspace": true,
+  "clean_end_to_end_rebuild_performed": false,
+  "hardware_specs_source": "owner message",
+  "v20_renderer_bytes_match_archive": true,
+  "data_initializer_generation": "passed using existing development translator",
+  "private_DSP_header_matches_v20_archive": true
+}

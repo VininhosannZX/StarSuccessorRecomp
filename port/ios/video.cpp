@@ -1,0 +1,2174 @@
+// wiikit runtime — the renderer: a window, and the GX record drawn with OpenGL 4.5.
+//
+// It runs on the host's main thread, which owns the window and the GL
+// context; the game runs on its own threads and hands over its GX record
+// (video.h) in chunks, at most --frames-ahead frames ahead. The renderer keeps a mirror
+// of the BP and XF registers from the record and turns each draw into GL
+// state and a program generated from the TEV configuration (gxshader.cpp).
+//
+// The EFB is a framebuffer of 640 x 528 (times --scale), stored top row
+// first as on the console. EFB copies stay on the host GPU: to the XFB they
+// become the frames VI shows, by address; to textures they are converted to
+// what the target format would decode to, and the game's later binds of that
+// address find them (gx.cpp). On each VI retrace the XFB that VI's top-field
+// register names is presented on a 4:3 or 16:9 screen (SYSCONF), as large as
+// the window allows.
+#include "video.h"
+#include "gl.h"
+#include "rt.h"
+#include <SDL3/SDL.h>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdlib>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#define WIIKIT_GL_DEFINE(T, n) T n = nullptr;
+WIIKIT_GL_FUNCS(WIIKIT_GL_DEFINE)
+#undef WIIKIT_GL_DEFINE
+
+std::string gx_shader_key(const uint32_t* bp, const uint32_t* xf, uint8_t vflags);
+void gx_shader_gen(const uint32_t* bp, const uint32_t* xf, uint8_t vflags, std::string& vs, std::string& fs);
+
+
+namespace {
+
+VideoOptions opt;
+constexpr int EFB_W = 640, EFB_H = 528;
+using Clock = std::chrono::steady_clock;
+
+// ---- the queue from the game ------------------------------------------------------------------
+struct Chunk { std::vector<uint8_t> data; int frames; bool readback = false; uint32_t copy = 0; };   // copy: video_copy_read's
+std::mutex qmx;
+std::condition_variable q_space;
+std::deque<Chunk> q;
+std::vector<std::vector<uint8_t>> spare;           // record buffers to reuse (under qmx)
+int q_frames = 0;
+SDL_Semaphore* wake = nullptr;
+std::atomic<uint32_t> xfb_addr{0}, retraces{0}, vi_lines{480};
+// an EFB read-back asked for by the CPU (video_efb_read), done in the queue's order
+std::mutex rb_mx;
+std::condition_variable rb_cv;
+bool rb_ready = false;
+std::vector<uint32_t>*rb_argb = nullptr, *rb_z = nullptr;
+std::vector<uint8_t>* rb_rgba = nullptr;           // video_copy_read's
+int rb_w = 0, rb_h = 0;
+std::mutex pad_mx;
+PadState pad;
+std::atomic<uint32_t> pending_buttons{0};
+ClassicState classic[4];
+
+// ---- GX state, as the record left it --------------------------------------------------------
+uint32_t bp[0x100], xf[0x1058];
+uint32_t xf_lo = 0, xf_hi = 0x1058;                // XF words not yet uploaded
+int32_t tev_reg[4][4], tev_konst[4][4];
+
+struct PSUniforms {                                // gxshader.cpp's uniform block PS (std140)
+    int32_t reg[4][4], konst[4][4], alpha[4];
+    float texdim[8][4];
+    int32_t indscale[4][4], indmtx[6][4];
+    int32_t fogi[4];
+    float fogf[4], fogk[3][4];
+};
+
+// ---- GL objects -------------------------------------------------------------------------------
+SDL_Window* win = nullptr;
+int S = 1;                                         // EFB scale
+GLuint efb_fbo, efb_col, efb_dep, copy_fbo, vao, empty_vao, vbo, quad_ibo, xf_ubo, ps_ubo, samplers[8];
+GLuint copy_prog;
+GLint copy_rect_loc, copy_mode_loc;
+constexpr size_t VBO_CAP = 64u << 20;
+size_t vbo_off = 0;
+// The vertex buffer is a ring mapped once, persistently: draws copy their
+// vertices straight into it. glBufferSubData into a buffer the GPU is still
+// reading makes the driver order a copy between draws, and at thousands of
+// draws a frame the GPU spends its time waiting on those. The ring is fenced
+// in quarters: a quarter is written again only when the GPU is done with it.
+uint8_t* vbo_ptr = nullptr;
+#ifdef _WIN32
+bool driver_vertex_upload=true;
+#else
+bool driver_vertex_upload=false;
+#endif
+std::vector<uint8_t> vertex_staging;
+GLsync vbo_fence[4] = {};
+constexpr size_t VBO_QUARTER = VBO_CAP / 4;
+PSUniforms ps_last;
+bool ps_valid = false;
+uint32_t sampler_mode[8][2];
+bool sampler_set[8];
+
+struct Tex { GLuint name = 0; int w = 0, h = 0, levels = 0; };
+std::unordered_map<uint32_t, Tex> texs;            // decoded textures, by id
+std::unordered_map<uint32_t, Tex> efb_copies;      // EFB copies to texture, by address
+std::unordered_map<uint32_t, Tex> xfbs;            // EFB copies to the XFB, by address
+uint64_t map_src[8];                               // per map: texture id, or 1 << 32 | EFB copy address
+uint32_t last_xfb = 0;
+std::unordered_map<std::string, GLuint> programs;       // by the registers that shape the code (gx_shader_key)
+// by the code itself: registers a game rewrites with bits the generator
+// ignores give new keys for the same code, and a link costs milliseconds
+// (Crystal Bearers: 1 160 keys for 396 programs in its title's first minute)
+std::unordered_map<std::string, GLuint> programs_by_source;
+
+struct Counters { uint64_t frames, presents, draws, programs, linked, cached; } cnt;
+bool dump_ps = false;                              // WIIKIT_SHADERDUMP: log the next uniforms
+
+int32_t s11(uint32_t v) { return (int32_t)((v & 0x7FF) << 21) >> 21; }
+int32_t s10(uint32_t v) { return (int32_t)((v & 0x3FF) << 22) >> 22; }
+float fx(uint32_t a) { float f; std::memcpy(&f, &xf[a], 4); return f; }
+
+// ---- GL helpers ---------------------------------------------------------------------------------
+bool gl_load() {
+    bool ok = true;
+#define WIIKIT_GL_LOAD(T, n)                                                   \
+    n = reinterpret_cast<T>(SDL_GL_GetProcAddress(#n));                        \
+    if (!n) { rt_log("video: no %s", #n); ok = false; }
+    WIIKIT_GL_FUNCS(WIIKIT_GL_LOAD)
+#undef WIIKIT_GL_LOAD
+    return ok;
+}
+
+// Bound framebuffer operations provide a compatibility path independent of DSA blits.
+PFNGLGETINTEGERVPROC compatGetInteger=nullptr;
+PFNGLBLITFRAMEBUFFERPROC compatBlit=nullptr;
+PFNGLDRAWBUFFERPROC compatDrawBuffer=nullptr;
+PFNGLREADBUFFERPROC compatReadBuffer=nullptr;
+GLuint present_prog=0,present_sampler=0;
+bool graphics_diagnostics=std::getenv("STAR_GRAPHICS_DIAGNOSTICS")!=nullptr;
+bool diagnostic_pending=false;
+uint64_t diagnostic_frame=0;
+uint32_t diagnostic_xfb=0;
+void diagnostic_texture(const char* stage,const Tex& t);
+void graphics_errors(const char* stage){
+ if(!graphics_diagnostics)return;
+ for(int i=0;i<16;++i){GLenum e=glGetError();if(e==GL_NO_ERROR)break;rt_log("graphics: GL error 0x%04X at %s",e,stage);}
+}
+void framebuffer_blit(GLuint source,GLuint target,GLint x0,GLint y0,GLint x1,GLint y1,
+                     GLint dx0,GLint dy0,GLint dx1,GLint dy1,GLbitfield mask,GLenum filter){
+ if(std::getenv("STAR_GL_NAMED_BLIT")){
+  glBlitNamedFramebuffer(source,target,x0,y0,x1,y1,dx0,dy0,dx1,dy1,mask,filter);return;
+ }
+ GLint read=0,draw=0;compatGetInteger(GL_READ_FRAMEBUFFER_BINDING,&read);compatGetInteger(GL_DRAW_FRAMEBUFFER_BINDING,&draw);
+ glBindFramebuffer(GL_READ_FRAMEBUFFER,source);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,target);
+ compatBlit(x0,y0,x1,y1,dx0,dy0,dx1,dy1,mask,filter);
+ glBindFramebuffer(GL_READ_FRAMEBUFFER,GLuint(read));glBindFramebuffer(GL_DRAW_FRAMEBUFFER,GLuint(draw));
+}
+
+// A link in two halves: started, the driver may compile on its own threads
+// (GL_KHR_parallel_shader_compile) while the renderer goes on; finished, it
+// waits for the driver if it has to.
+struct Linking { GLuint p = 0, v = 0, f = 0; };
+
+Linking link_start(const std::string& vs, const std::string& fs) {
+    Linking l;
+    auto shader = [](GLenum type, const std::string& src) {
+        GLuint sh = glCreateShader(type);
+        const char* c = src.c_str();
+        glShaderSource(sh, 1, &c, nullptr);
+        glCompileShader(sh);
+        return sh;
+    };
+    l.v = shader(GL_VERTEX_SHADER, vs);
+    l.f = shader(GL_FRAGMENT_SHADER, fs);
+    l.p = glCreateProgram();
+    glAttachShader(l.p, l.v);
+    glAttachShader(l.p, l.f);
+    if(!std::getenv("STAR_GL_PROBE_NO_BINARY_HINT"))glProgramParameteri(l.p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);   // for the shader cache
+    glLinkProgram(l.p);
+    return l;
+}
+
+GLuint link_finish(Linking& l, const std::string& vs, const std::string& fs) {
+    GLint ok = 0;
+    for (auto [sh, src] : {std::pair<GLuint, const std::string*>{l.v, &vs}, {l.f, &fs}}) {
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[4096];
+            glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+            rt_log("video: shader does not compile:\n%s\n%s", log, src->c_str());
+        }
+    }
+    glDeleteShader(l.v);
+    glDeleteShader(l.f);
+    glGetProgramiv(l.p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(l.p, sizeof log, nullptr, log);
+        rt_log("video: program does not link: %s", log);
+        glDeleteProgram(l.p);
+        return 0;
+    }
+    return l.p;
+}
+
+GLuint link(const std::string& vs, const std::string& fs) {
+    Linking l = link_start(vs, fs);
+    return link_finish(l, vs, fs);
+}
+
+// The shader cache: each program linked is kept on disk as the driver's
+// binary (VideoOptions::shader_cache, EXTRACT_DIR/../shadercache), named by
+// a hash of its source and of the driver. The next time the game asks for
+// it, it loads in microseconds where a link takes milliseconds: a scene seen
+// once no longer stutters the first time it is drawn again. A driver that
+// changed gives other names; one that refuses a binary gets the program
+// linked anew.
+uint64_t source_hash(const std::string& source) {
+    static const std::string driver = std::string("star-gx-v20-separated-attributes:") + std::string((const char*)glGetString(GL_RENDERER)) + '\0' +
+                                      (const char*)glGetString(GL_VERSION) + '\0';
+    uint64_t h = 0xCBF29CE484222325ull;                                  // FNV-1a
+    for (const std::string* s : {&driver, &source})
+        for (unsigned char ch : *s) h = (h ^ ch) * 0x100000001B3ull;
+    return h;
+}
+
+std::string cache_path(uint64_t hash) {
+    char name[32];
+    std::snprintf(name, sizeof name, "/%016llx.bin", (unsigned long long)hash);
+    return opt.shader_cache + name;
+}
+
+GLuint load_program(uint64_t hash) {
+    if (opt.shader_cache.empty()) return 0;
+    FILE* f = std::fopen(cache_path(hash).c_str(), "rb");
+    if (!f) return 0;
+    std::vector<uint8_t> data;
+    uint8_t buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
+    std::fclose(f);
+    if (data.size() <= 4) return 0;
+    GLenum format;
+    std::memcpy(&format, data.data(), 4);
+    GLuint p = glCreateProgram();
+    glProgramBinary(p, format, data.data() + 4, (GLsizei)(data.size() - 4));
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(p); return 0; }
+    return p;
+}
+
+void save_program(GLuint p, uint64_t hash) {
+    if (opt.shader_cache.empty()) return;
+    static bool made = false;
+    if (!made) { made = true; std::error_code ec; std::filesystem::create_directories(opt.shader_cache, ec); }
+    GLint len = 0;
+    glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0) return;
+    std::vector<uint8_t> data(4 + (size_t)len);
+    GLenum format = 0;
+    glGetProgramBinary(p, len, nullptr, &format, data.data() + 4);
+    std::memcpy(data.data(), &format, 4);
+    if (FILE* f = std::fopen(cache_path(hash).c_str(), "wb")) {
+        std::fwrite(data.data(), 1, data.size(), f);
+        std::fclose(f);
+    }
+}
+
+void ensure_tex(Tex& t, int w, int h, int levels) {
+    if (t.name && t.w == w && t.h == h && t.levels == levels) return;
+    if (t.name) glDeleteTextures(1, &t.name);
+    glCreateTextures(GL_TEXTURE_2D, 1, &t.name);
+    glTextureStorage2D(t.name, levels, GL_RGBA8, w, h);
+    t.w = w; t.h = h; t.levels = levels;
+}
+
+void APIENTRY gl_debug(GLenum, GLenum type, GLuint, GLenum severity, GLsizei, const GLchar* msg, const void*) {
+    if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) return;
+    rt_log("gl: %s%s", type == GL_DEBUG_TYPE_ERROR ? "error: " : "", msg);
+}
+
+// ---- the EFB copy pass --------------------------------------------------------------------------
+const char* FULLSCREEN_VS = R"(#version 450 core
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// what a copy to each texture copy format (Dolphin's EFBCopyFormat numbering)
+// reads back as when the game samples it
+const char* COPY_FS = R"(#version 450 core
+layout(binding = 0) uniform sampler2D efb_color;
+layout(binding = 1) uniform sampler2D efb_depth;
+uniform ivec4 u_rect;   // source x, y (EFB pixels at scale), half size, -
+uniform ivec4 u_mode;   // format, from depth, intensity, EFB has alpha
+out vec4 o;
+vec4 src(ivec2 p) {
+    if (u_mode.y != 0) {
+        uint z = uint(clamp(texelFetch(efb_depth, p, 0).r, 0.0, 1.0) * 16777215.0);
+        return vec4(float(z >> 16), float((z >> 8) & 255u), float(z & 255u), 255.0) / 255.0;
+    }
+    vec4 c = texelFetch(efb_color, p, 0);
+    if (u_mode.w == 0) c.a = 1.0;
+    return c;
+}
+float q(float v, float n) { return floor(v * n + 0.5) / n; }
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c;
+    if (u_rect.z != 0) {
+        ivec2 s = u_rect.xy + p * 2;
+        c = (src(s) + src(s + ivec2(1, 0)) + src(s + ivec2(0, 1)) + src(s + ivec2(1, 1))) * 0.25;
+    } else {
+        c = src(u_rect.xy + p);
+    }
+    float i = (u_mode.z != 0 && u_mode.y == 0) ? clamp(0.257 * c.r + 0.504 * c.g + 0.098 * c.b + 16.0 / 255.0, 0.0, 1.0) : c.r;
+    switch (u_mode.x) {
+    case 0: o = vec4(q(i, 15.0)); break;                                  // R4 / Z4
+    case 1: case 8: o = vec4(i); break;                                   // R8 / Z8
+    case 2: o = vec4(vec3(q(i, 15.0)), q(c.a, 15.0)); break;              // RA4
+    case 3: o = u_mode.y != 0 ? vec4(c.ggg, c.r) : vec4(vec3(i), c.a); break;   // RA8 / Z16
+    case 4: o = vec4(q(c.r, 31.0), q(c.g, 63.0), q(c.b, 31.0), 1.0); break;
+    case 5: o = c.a >= 0.875 ? vec4(q(c.r, 31.0), q(c.g, 31.0), q(c.b, 31.0), 1.0)
+                             : vec4(q(c.r, 15.0), q(c.g, 15.0), q(c.b, 15.0), q(c.a, 7.0)); break;
+    case 7: o = vec4(c.a); break;                                         // A8
+    case 9: o = vec4(c.g); break;                                         // G8 / Z8M
+    case 10: o = vec4(c.b); break;                                        // B8 / Z8L
+    // RG8 and GB8 are two channels in an IA8-shaped texture: the second
+    // channel first in memory, so it is the alpha (read as IA8: RG8 is
+    // I = R, A = G; GB8 is I = G, A = B). A colour-grading pass reads G as
+    // the intensity and B as the alpha of a GB8 copy, as Dolphin encodes it.
+    case 11: o = vec4(c.rrr, c.g); break;                                 // RG8
+    case 12: o = u_mode.y != 0 ? vec4(c.bbb, c.g) : vec4(c.ggg, c.b); break;   // Z16L / GB8
+    default: o = c; break;                                                // RGBA8 / Z24X8
+    }
+}
+)";
+
+// ---- register side effects ----------------------------------------------------------------------
+void efb_clear(int x, int y, int w, int h) {
+    bool has_alpha = (bp[0x43] & 7) == 1;
+    bool cu = bp[0x41] >> 3 & 1, au = bp[0x41] >> 4 & 1, zu = bp[0x40] >> 4 & 1;
+    if (!cu && !au && !zu) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x * S, y * S, w * S, h * S);
+    glColorMask(cu, cu, cu, au || !has_alpha);
+    glDepthMask(zu);
+    float a = (bp[0x4F] >> 8 & 255) / 255.0f, r = (bp[0x4F] & 255) / 255.0f;
+    float g = (bp[0x50] >> 8 & 255) / 255.0f, b = (bp[0x50] & 255) / 255.0f;
+    glClearColor(r, g, b, has_alpha ? a : 1.0f);
+    glClearDepth((bp[0x51] & 0xFFFFFF) / 16777215.0);
+    glClear((cu || au ? GL_COLOR_BUFFER_BIT : 0) | (zu ? GL_DEPTH_BUFFER_BIT : 0));
+}
+
+// WIIKIT_EFBDUMP=N: the EFB as PNGs during frame N (counted in XFB copies):
+// before each EFB copy, and every WIIKIT_EFBDUMP_EVERY draws (debugging)
+long efb_dump_frame = std::getenv("WIIKIT_EFBDUMP") ? std::atol(std::getenv("WIIKIT_EFBDUMP")) : -1;
+long efb_dump_every = std::getenv("WIIKIT_EFBDUMP_EVERY") ? std::atol(std::getenv("WIIKIT_EFBDUMP_EVERY")) : 0;
+bool efb_dumping() { return (long)cnt.frames == efb_dump_frame; }
+void efb_dump(const char* tag) {
+    static int k = 0;
+    std::vector<uint8_t> px((size_t)EFB_W * S * EFB_H * S * 4);   // top row first, as the EFB is kept
+    glGetTextureImage(efb_col, 0, GL_RGBA, GL_UNSIGNED_BYTE, (GLsizei)px.size(), px.data());
+    char name[160];
+    std::snprintf(name, sizeof name, "efb_%ld_%04d_%s.png", efb_dump_frame, k++, tag);
+    write_png(name, EFB_W * S, EFB_H * S, px.data());
+}
+
+void efb_copy(uint32_t v) {
+    int x = (int)(bp[0x49] & 0x3FF), y = (int)(bp[0x49] >> 10 & 0x3FF);
+    int w = (int)(bp[0x4A] & 0x3FF) + 1, h = (int)(bp[0x4A] >> 10 & 0x3FF) + 1;
+    uint32_t dest = (bp[0x4B] & 0xFFFFFF) << 5;
+    glDisable(GL_SCISSOR_TEST);
+    if (efb_dumping()) {
+        char tag[64];
+        std::snprintf(tag, sizeof tag, "copy_%06X_%d_%d_%dx%d", v, x, y, w, h);
+        efb_dump(tag);
+    }
+    if (v >> 14 & 1) {                                           // to the XFB
+        const uint64_t next_frame=cnt.frames+1;
+        const bool capture=graphics_diagnostics&&(next_frame==120||next_frame==600||next_frame==1800||next_frame==3000);
+        if(capture){diagnostic_frame=next_frame;diagnostic_texture("efb-before-copy",Tex{efb_col,EFB_W*S,EFB_H*S,1});}
+        Tex& t = xfbs[dest];
+        ensure_tex(t, w * S, h * S, 1);
+        glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
+        framebuffer_blit(efb_fbo, copy_fbo, x * S, y * S, (x + w) * S, (y + h) * S, 0, 0, w * S, h * S,
+                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        last_xfb = dest;
+        ++cnt.frames;
+        if(capture){diagnostic_texture("xfb-after-copy",t);diagnostic_pending=true;diagnostic_xfb=dest;}
+    } else {                                                     // to a texture
+        bool half = v >> 9 & 1;
+        int tw = half ? (w + 1) / 2 : w, th = half ? (h + 1) / 2 : h;
+        uint32_t tpf = v >> 3 & 15, fmt = tpf / 2 + (tpf & 1) * 8;
+        Tex& t = efb_copies[dest];
+        ensure_tex(t, tw * S, th * S, 1);
+        glNamedFramebufferTexture(copy_fbo, GL_COLOR_ATTACHMENT0, t.name, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
+        glViewport(0, 0, tw * S, th * S);
+        glDisable(GL_BLEND);
+        glDisable(GL_COLOR_LOGIC_OP);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(1, 1, 1, 1);
+        glUseProgram(copy_prog);
+        glProgramUniform4i(copy_prog, copy_rect_loc, x * S, y * S, half, 0);
+        glProgramUniform4i(copy_prog, copy_mode_loc, (int)fmt, (bp[0x43] & 7) == 3, (int)(v >> 15 & 1),
+                           (bp[0x43] & 7) == 1);
+        glBindTextureUnit(0, efb_col);
+        glBindTextureUnit(1, efb_dep);
+        glBindSampler(0, 0);
+        glBindSampler(1, 0);
+        glBindVertexArray(empty_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(vao);
+    }
+    if (v >> 11 & 1) efb_clear(x, y, w, h);
+}
+
+void bp_set(uint32_t v) {
+    uint32_t reg = v >> 24, val = v & 0xFFFFFF;
+    bp[reg] = val;
+    if (reg >= 0xE0 && reg < 0xE8) {                             // TEV colour and konst registers
+        int32_t* r = (val >> 23 & 1) ? tev_konst[(reg - 0xE0) / 2] : tev_reg[(reg - 0xE0) / 2];
+        if (!(reg & 1)) { r[0] = s11(val); r[3] = s11(val >> 12); }   // RA
+        else { r[2] = s11(val); r[1] = s11(val >> 12); }              // BG
+    }
+    if (reg == 0x52) efb_copy(val);
+}
+
+// ---- the shader list ----------------------------------------------------------------------------
+// A link costs 25-200 ms on a desktop driver (The Last Story: 183 in a
+// quarter of an hour of play, each one a stall where something came into
+// view). The cache keeps them for the next time, but only on that machine and
+// that driver, and a change to the generator (fog) makes them new again. The
+// list keeps what is the game's own: for each program, the registers that
+// shape it (gx_shader_regs), one line of "b00=... x1009=... v=..." in hex.
+// At the start, the list's programs that the cache lacks are generated again
+// with today's generator and linked in the background, the driver compiling
+// on its own threads (GL_KHR_parallel_shader_compile), a few at a time;
+// a draw that needs one before it is ready waits only for what is left.
+struct Warm { std::string vs, fs; uint64_t hash; Linking l; bool started = false; };
+std::unordered_map<std::string, Warm> warming;     // by source: listed, not linked yet
+std::deque<std::string> warm_order;                // sources to start, in the list's order
+std::unordered_set<uint64_t> listed;               // sources (source_hash) already in a list
+int warm_running = 0, warm_total = 0, warm_done = 0;
+Clock::time_point warm_t0;
+
+std::string list_line(const GxShaderReg* r, int n) {
+    std::string line;
+    char buf[24];
+    for (int i = 0; i < n; ++i) {
+        if (r[i].space == 'v') std::snprintf(buf, sizeof buf, "%sv=%X", i ? " " : "", r[i].value);
+        else std::snprintf(buf, sizeof buf, "%s%c%02X=%X", i ? " " : "", r[i].space, r[i].addr, r[i].value);
+        line += buf;
+    }
+    return line;
+}
+
+// the code a list line gives, on registers that are zero but for its own
+bool list_source(const std::string& line, std::string& vs, std::string& fs) {
+    static uint32_t lbp[0x100], lxf[0x1058];
+    std::memset(lbp, 0, sizeof lbp);
+    std::memset(lxf, 0, sizeof lxf);
+    uint8_t vflags = 0;
+    const char* p = line.c_str();
+    int n = 0;
+    while (*p) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        char space = *p++;
+        unsigned addr = 0, value = 0;
+        int used = 0;
+        if (space == 'v' ? std::sscanf(p, "=%x%n", &value, &used) != 1
+                         : std::sscanf(p, "%x=%x%n", &addr, &value, &used) != 2) return false;
+        p += used;
+        if (space == 'b' && addr < 0x100) lbp[addr] = value;
+        else if (space == 'x' && addr >= 0x1000 && addr < 0x1058) lxf[addr] = value;
+        else if (space == 'v') vflags = (uint8_t)value;
+        else return false;
+        ++n;
+    }
+    if (!n) return false;
+    gx_shader_gen(lbp, lxf, vflags, vs, fs);
+    return true;
+}
+
+// a program the game uses for the first time in this run, into the list
+void list_add(uint8_t vflags, const std::string& source, uint64_t hash) {
+    if (opt.shader_list.empty() || !listed.insert(hash).second) return;
+    GxShaderReg r[GX_SHADER_REGS_MAX];
+    std::string line = list_line(r, gx_shader_regs(bp, xf, vflags, r)), vs, fs;
+    // the line must give this code back, or it is no use
+    if (!list_source(line, vs, fs) || vs + '\0' + fs != source) {
+        static bool told = false;
+        if (!told) { told = true; rt_log("video: shader list: a program its registers do not give back (not listed)"); }
+        return;
+    }
+    if (FILE* f = std::fopen(opt.shader_list.c_str(), "ab")) {
+        std::fprintf(f, "%s\n", line.c_str());
+        std::fclose(f);
+    }
+}
+
+void warm_read(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    std::string text;
+    char buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    std::fclose(f);
+    size_t lines = 0, bad = 0, queued = 0;
+    for (size_t at = 0; at < text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        ++lines;
+        Warm w;
+        if (!list_source(line, w.vs, w.fs)) { ++bad; continue; }
+        std::string source = w.vs + '\0' + w.fs;
+        w.hash = source_hash(source);
+        if (!listed.insert(w.hash).second) continue;              // in a list already
+        if (std::filesystem::exists(cache_path(w.hash))) continue;  // the cache has it
+        warm_order.push_back(source);
+        warming.emplace(std::move(source), std::move(w));
+        ++queued;
+    }
+    rt_log("video: shader list %s: %zu programs, %zu to link%s", path.c_str(), lines, queued,
+           bad ? (", " + std::to_string(bad) + " lines not understood").c_str() : "");
+}
+
+void warm_start() {
+    if (opt.shader_cache.empty()) return;
+    for (const std::string& path : opt.shader_lists) warm_read(path);
+    if (!opt.shader_list.empty()) warm_read(opt.shader_list);
+    warm_total = (int)warming.size();
+    if (!warm_total) return;
+    bool parallel = SDL_GL_ExtensionSupported("GL_KHR_parallel_shader_compile") ||
+                    SDL_GL_ExtensionSupported("GL_ARB_parallel_shader_compile");
+    if (parallel) {
+        using MaxThreads = void(APIENTRY*)(GLuint);
+        auto max_threads = reinterpret_cast<MaxThreads>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsKHR"));
+        if (!max_threads) max_threads = reinterpret_cast<MaxThreads>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsARB"));
+        if (max_threads) max_threads(0xFFFFFFFF);            // as many as the driver likes
+    } else {
+        rt_log("video: shader list: the driver cannot link in the background; the programs link when first drawn");
+        warming.clear();
+        warm_order.clear();
+        warm_total = 0;
+        return;
+    }
+    warm_t0 = Clock::now();
+}
+
+// once per turn of the renderer's loop: start a few, finish the ready ones
+void warm_poll() {
+    if (!warm_total) return;
+    constexpr int RUNNING = 16, STARTS = 4;
+    for (int k = 0; k < STARTS && warm_running < RUNNING && !warm_order.empty();) {
+        std::string source = std::move(warm_order.front());
+        warm_order.pop_front();
+        auto w = warming.find(source);
+        if (w == warming.end()) continue;                       // a draw took it
+        w->second.l = link_start(w->second.vs, w->second.fs);
+        w->second.started = true;
+        ++warm_running;
+        ++k;
+    }
+    for (auto w = warming.begin(); w != warming.end();) {
+        if (!w->second.started) { ++w; continue; }
+        GLint done = 0;
+        glGetProgramiv(w->second.l.p, GL_COMPLETION_STATUS_KHR, &done);
+        if (!done) { ++w; continue; }
+        GLuint p = link_finish(w->second.l, w->second.vs, w->second.fs);
+        if (p) save_program(p, w->second.hash);
+        programs_by_source.emplace(w->first, p);                // where the first draw with it looks
+        --warm_running;
+        ++warm_done;
+        w = warming.erase(w);
+    }
+    if (warming.empty()) {
+        rt_log("video: shader list: %d of %d programs linked in the background in %.1f s", warm_done, warm_total,
+               std::chrono::duration<double>(Clock::now() - warm_t0).count());
+        warm_total = 0;
+    }
+}
+
+// ---- draws --------------------------------------------------------------------------------------
+GLuint program_for(uint8_t vflags) {
+    std::string key = gx_shader_key(bp, xf, vflags);
+    auto it = programs.find(key);
+    if (it != programs.end()) return it->second;
+    std::string vs, fs;
+    gx_shader_gen(bp, xf, vflags, vs, fs);
+    std::string source = vs + '\0' + fs;
+    if (auto same = programs_by_source.find(source); same != programs_by_source.end()) {
+        programs.emplace(std::move(key), same->second);
+        return same->second;
+    }
+    uint64_t hash = source_hash(source);
+    // WIIKIT_PERF=1: links that hold up the frame (a scene's first sight)
+    static const bool tell = std::getenv("WIIKIT_PERF") != nullptr;
+    auto t0 = Clock::now();
+    GLuint p = 0;
+    const char* how = "linked";
+    if (auto w = warming.find(source); w != warming.end()) {
+        // in the shader list, not linked yet: the draw waits for the rest
+        if (w->second.started) { p = link_finish(w->second.l, vs, fs); how = "waited for (listed)"; --warm_running; }
+        else p = link(vs, fs);
+        warming.erase(w);
+        if (p) { ++cnt.linked; save_program(p, hash); }
+    } else if ((p = load_program(hash))) {
+        ++cnt.cached;
+    } else if ((p = link(vs, fs))) {
+        ++cnt.linked;
+        save_program(p, hash);
+    }
+    double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    if (tell && ms >= 20) rt_log("video: program %llu %s in %.1f ms", (unsigned long long)cnt.programs, how, ms);
+    list_add(vflags, source, hash);
+    programs_by_source.emplace(std::move(source), p);
+    if (const char* dir = std::getenv("WIIKIT_SHADERDUMP")) {           // debugging: the sources
+        std::string path = std::string(dir) + "/prog_" + std::to_string(cnt.programs) + ".glsl";
+        if (FILE* f = std::fopen(path.c_str(), "w")) {
+            std::fprintf(f, "%s\n// ---- fragment\n%s", vs.c_str(), fs.c_str());
+            std::fclose(f);
+        }
+        dump_ps = true;
+    }
+    programs.emplace(std::move(key), p);
+    ++cnt.programs;
+    return p;
+}
+
+uint32_t used_maps() {
+    uint32_t gen = bp[0x00], used = 0;
+    int ntev = (int)(gen >> 10 & 15) + 1, nind = (int)(gen >> 16 & 7);
+    for (int s = 0; s < ntev; ++s) {
+        uint32_t t = bp[0x28 + s / 2] >> (12 * (s & 1));
+        if (t & 0x40) used |= 1u << (t & 7);
+    }
+    for (int i = 0; i < nind && i < 4; ++i) used |= 1u << (bp[0x27] >> (6 * i) & 7);
+    return used;
+}
+
+void set_ps_uniforms() {
+    PSUniforms u{};
+    std::memcpy(u.reg, tev_reg, sizeof u.reg);
+    std::memcpy(u.konst, tev_konst, sizeof u.konst);
+    u.alpha[0] = (int32_t)(bp[0xF3] & 255);
+    u.alpha[1] = (int32_t)(bp[0xF3] >> 8 & 255);
+    u.alpha[2] = (int32_t)(bp[0x42] & 255);
+    for (int m = 0; m < 8; ++m) {
+        uint32_t img0 = bp[0x88 + (m & 3) + (m >= 4 ? 0x20 : 0)];
+        u.texdim[m][0] = 1.0f / (float)(((img0 & 0x3FF) + 1) * 128);
+        u.texdim[m][1] = 1.0f / (float)(((img0 >> 10 & 0x3FF) + 1) * 128);
+        u.texdim[m][2] = (float)(((bp[0x30 + 2 * m] & 0xFFFF) + 1) * 128);
+        u.texdim[m][3] = (float)(((bp[0x31 + 2 * m] & 0xFFFF) + 1) * 128);
+    }
+    for (int i = 0; i < 4; ++i) {
+        uint32_t r = bp[0x25 + i / 2] >> (8 * (i & 1));
+        u.indscale[i][0] = (int32_t)(r & 15);
+        u.indscale[i][1] = (int32_t)(r >> 4 & 15);
+    }
+    for (int m = 0; m < 3; ++m) {
+        uint32_t c0 = bp[0x06 + 3 * m], c1 = bp[0x07 + 3 * m], c2 = bp[0x08 + 3 * m];
+        int32_t scale = (int32_t)((c0 >> 22 & 3) | (c1 >> 22 & 3) << 2 | (c2 >> 22 & 3) << 4);
+        int32_t r0[4] = {s11(c0), s11(c1), s11(c2), 17 - scale};
+        int32_t r1[4] = {s11(c0 >> 11), s11(c1 >> 11), s11(c2 >> 11), 17 - scale};
+        std::memcpy(u.indmtx[2 * m], r0, sizeof r0);
+        std::memcpy(u.indmtx[2 * m + 1], r1, sizeof r1);
+    }
+    if (bp[0xF1] >> 21 & 7) {                                  // fog (gxshader.cpp)
+        // A and C: a sign, an 8-bit exponent and an 11-bit mantissa, a float's
+        // top 20 bits
+        uint32_t a = (bp[0xEE] & 0xFFFFF) << 12, c = (bp[0xF1] & 0xFFFFF) << 12;
+        std::memcpy(&u.fogf[0], &a, 4);
+        std::memcpy(&u.fogf[1], &c, 4);
+        // the range's centre is in the viewport's coordinates, the scissor offset in
+        u.fogf[2] = (float)((int)(bp[0xE8] & 0x3FF) - s10(bp[0x59]) * 2);
+        u.fogf[3] = std::fabs(fx(0x101A));
+        u.fogi[0] = (int32_t)(bp[0xEF] & 0xFFFFFF);
+        u.fogi[1] = (int32_t)(bp[0xF0] & 31);
+        u.fogi[2] = (int32_t)(bp[0xF2] & 0xFFFFFF);
+        u.fogi[3] = S;
+        for (int i = 0; i < 12; ++i) {
+            int j = i < 10 ? i : 9;
+            u.fogk[i / 4][i % 4] = (float)(bp[0xE9 + j / 2] >> (12 * (j & 1)) & 0xFFF) / 256.0f;
+        }
+    }
+    if (dump_ps) {
+        dump_ps = false;
+        std::string t = "video: program " + std::to_string(cnt.programs - 1) + " uniforms:";
+        for (int i = 0; i < 4; ++i) t += " reg" + std::to_string(i) + "(" + std::to_string(u.reg[i][0]) + "," + std::to_string(u.reg[i][1]) + "," + std::to_string(u.reg[i][2]) + "," + std::to_string(u.reg[i][3]) + ")";
+        for (int i = 0; i < 4; ++i) t += " k" + std::to_string(i) + "(" + std::to_string(u.konst[i][0]) + "," + std::to_string(u.konst[i][1]) + "," + std::to_string(u.konst[i][2]) + "," + std::to_string(u.konst[i][3]) + ")";
+        for (int i = 0; i < 8; ++i) t += " td" + std::to_string(i) + "(" + std::to_string(1 / u.texdim[i][0] / 128) + "," + std::to_string(1 / u.texdim[i][1] / 128) + "," + std::to_string(u.texdim[i][2] / 128) + "," + std::to_string(u.texdim[i][3] / 128) + ")";
+        for (int i = 0; i < 4; ++i) t += " is" + std::to_string(i) + "(" + std::to_string(u.indscale[i][0]) + "," + std::to_string(u.indscale[i][1]) + ")";
+        for (int i = 0; i < 6; ++i) t += " im" + std::to_string(i) + "(" + std::to_string(u.indmtx[i][0]) + "," + std::to_string(u.indmtx[i][1]) + "," + std::to_string(u.indmtx[i][2]) + "," + std::to_string(u.indmtx[i][3]) + ")";
+        rt_log("%s", t.c_str());
+    }
+    if (ps_valid && !std::memcmp(&u, &ps_last, sizeof u)) return;
+    glNamedBufferSubData(ps_ubo, 0, sizeof u, &u);
+    ps_last = u;
+    ps_valid = true;
+}
+
+void bind_textures() {
+    static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT, GL_REPEAT};
+    static const GLint minf[8] = {GL_NEAREST, GL_NEAREST_MIPMAP_NEAREST, GL_NEAREST_MIPMAP_LINEAR, GL_NEAREST,
+                                  GL_LINEAR, GL_LINEAR_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR};
+    uint32_t used = used_maps();
+    for (int m = 0; m < 8; ++m) {
+        if (!(used >> m & 1)) continue;
+        GLuint name = 0;
+        if (map_src[m] >> 32) {
+            auto it = efb_copies.find((uint32_t)map_src[m]);
+            if (it != efb_copies.end()) name = it->second.name;
+        } else {
+            auto it = texs.find((uint32_t)map_src[m]);
+            if (it != texs.end()) name = it->second.name;
+        }
+        glBindTextureUnit(m, name);
+        int off = (m & 3) + (m >= 4 ? 0x20 : 0);
+        uint32_t m0 = bp[0x80 + off], m1 = bp[0x84 + off];
+        if (!sampler_set[m] || sampler_mode[m][0] != m0 || sampler_mode[m][1] != m1) {
+            GLuint s = samplers[m];
+            glSamplerParameteri(s, GL_TEXTURE_WRAP_S, wrap[m0 & 3]);
+            glSamplerParameteri(s, GL_TEXTURE_WRAP_T, wrap[m0 >> 2 & 3]);
+            glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, (m0 >> 4 & 1) ? GL_LINEAR : GL_NEAREST);
+            glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, minf[m0 >> 5 & 7]);
+            glSamplerParameterf(s, GL_TEXTURE_LOD_BIAS, (float)(int8_t)(m0 >> 9 & 0xFF) / 32.0f);
+            glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, (float)(m1 & 0xFF) / 16.0f);
+            glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, (float)(m1 >> 8 & 0xFF) / 16.0f);
+            sampler_mode[m][0] = m0;
+            sampler_mode[m][1] = m1;
+            sampler_set[m] = true;
+        }
+        glBindSampler(m, samplers[m]);
+    }
+}
+
+// A VC_DRAW's pieces (each n, then n vertices), drawn with one call.
+void draw(uint8_t prim, uint8_t vflags, const uint8_t* pieces, uint32_t npieces) {
+    uint32_t n = 0;
+    const uint8_t* vtx = pieces + 4;                           // the first vertex
+    for (uint32_t i = 0, k; i < npieces; ++i) {
+        std::memcpy(&k, pieces + (size_t)n * sizeof(GVtx) + 4 * i, 4);
+        n += k;
+    }
+    uint32_t cull = bp[0x00] >> 14 & 3;
+    bool tri = prim < 0xA8;
+    if (tri && cull == 3) return;
+    GLuint prog = program_for(vflags);
+    if (!prog) return;
+    ++cnt.draws;
+    if(graphics_diagnostics&&dump_ps&&n){
+        GVtx sample{};std::memcpy(&sample,vtx,sizeof sample);
+        rt_log("graphics: draw prim=%02X vertices=%u stride=%zu matrix=%u pos=(%g,%g,%g) viewport=(%g,%g,%g,%g) proj=(%g,%g,%g,%g,%g,%g) material=%08X alpha=%08X",
+            prim,n,sizeof(GVtx),sample.mtx[0],sample.pos[0],sample.pos[1],sample.pos[2],
+            fx(0x101A),fx(0x101B),fx(0x101D),fx(0x101E),
+            fx(0x1020),fx(0x1021),fx(0x1022),fx(0x1023),fx(0x1024),fx(0x1025),xf[0x100C],bp[0xF3]);
+        const unsigned pm=sample.mtx[0]*4u;
+        rt_log("graphics: matrix rows=(%g,%g,%g,%g) (%g,%g,%g,%g) (%g,%g,%g,%g) viewport-z=(%g,%g)",
+            fx(pm),fx(pm+1),fx(pm+2),fx(pm+3),fx(pm+4),fx(pm+5),fx(pm+6),fx(pm+7),fx(pm+8),fx(pm+9),fx(pm+10),fx(pm+11),fx(0x101C),fx(0x101F));
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glUseProgram(prog);
+
+    int offx = s10(bp[0x59]) * 2, offy = s10(bp[0x59] >> 10) * 2;
+    float wd = std::fabs(fx(0x101A)), ht = std::fabs(fx(0x101B));
+    glViewportIndexedf(0, (fx(0x101D) - wd - (float)offx) * (float)S, (fx(0x101E) - ht - (float)offy) * (float)S,
+                       2 * wd * (float)S, 2 * ht * (float)S);
+    int sx0 = (int)(bp[0x20] >> 12 & 0x7FF) - offx, sy0 = (int)(bp[0x20] & 0x7FF) - offy;
+    int sx1 = (int)(bp[0x21] >> 12 & 0x7FF) - offx + 1, sy1 = (int)(bp[0x21] & 0x7FF) - offy + 1;
+    sx0 = std::max(sx0, 0); sy0 = std::max(sy0, 0); sx1 = std::min(sx1, EFB_W); sy1 = std::min(sy1, EFB_H);
+    if (sx1 <= sx0 || sy1 <= sy0) return;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sx0 * S, sy0 * S, (sx1 - sx0) * S, (sy1 - sy0) * S);
+
+    static const GLenum zf[8] = {GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS};
+    uint32_t zm = bp[0x40];
+    if (zm & 1) { glEnable(GL_DEPTH_TEST); glDepthFunc(zf[zm >> 1 & 7]); }
+    else glDisable(GL_DEPTH_TEST);
+    glDepthMask(zm >> 4 & 1);
+
+    uint32_t cm = bp[0x41];
+    bool has_alpha = (bp[0x43] & 7) == 1;
+    glColorMask(cm >> 3 & 1, cm >> 3 & 1, cm >> 3 & 1, (cm >> 4 & 1) && has_alpha);
+    if (cm & 1) {
+        glDisable(GL_COLOR_LOGIC_OP);
+        glEnable(GL_BLEND);
+        if (cm >> 11 & 1) {                                      // subtract: dst - src
+            glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+        } else {
+            GLenum da = has_alpha ? GL_DST_ALPHA : GL_ONE, ida = has_alpha ? GL_ONE_MINUS_DST_ALPHA : GL_ZERO;
+            const GLenum src[8] = {GL_ZERO, GL_ONE, GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR,
+                                   GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA, da, ida};
+            const GLenum dst[8] = {GL_ZERO, GL_ONE, GL_SRC1_COLOR, GL_ONE_MINUS_SRC1_COLOR,
+                                   GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA, da, ida};
+            GLenum sf = src[cm >> 8 & 7], df = dst[cm >> 5 & 7];
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFuncSeparate(sf, df, sf, df);
+        }
+    } else if (cm >> 1 & 1) {
+        static const GLenum lo[16] = {GL_CLEAR, GL_AND, GL_AND_REVERSE, GL_COPY, GL_AND_INVERTED, GL_NOOP,
+                                      GL_XOR, GL_OR, GL_NOR, GL_EQUIV, GL_INVERT, GL_OR_REVERSE,
+                                      GL_COPY_INVERTED, GL_OR_INVERTED, GL_NAND, GL_SET};
+        glDisable(GL_BLEND);
+        glEnable(GL_COLOR_LOGIC_OP);
+        glLogicOp(lo[cm >> 12 & 15]);
+    } else {
+        glDisable(GL_BLEND);
+        glDisable(GL_COLOR_LOGIC_OP);
+    }
+    // GX's front faces are clockwise on screen: counter-clockwise for GL,
+    // whose y runs the other way over the same rows
+    if (tri && cull) { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
+    else glDisable(GL_CULL_FACE);
+
+    if (xf_lo < xf_hi) {
+        glNamedBufferSubData(xf_ubo, xf_lo * 4, (xf_hi - xf_lo) * 4, &xf[xf_lo]);
+        xf_lo = 0x1058;
+        xf_hi = 0;
+    }
+    set_ps_uniforms();
+    bind_textures();
+
+    if (efb_dumping() && std::getenv("WIIKIT_DRAWLOG")) {         // debugging: where each draw lands
+        static FILE* lf = std::fopen("drawlog.txt", "w");
+        const GVtx& v0 = *reinterpret_cast<const GVtx*>(vtx);
+        uint32_t pm = v0.mtx[0] * 4u;
+        float pos[3];
+        for (int r = 0; r < 3; ++r)
+            pos[r] = fx(pm + r * 4) * v0.pos[0] + fx(pm + r * 4 + 1) * v0.pos[1] + fx(pm + r * 4 + 2) * v0.pos[2] + fx(pm + r * 4 + 3);
+        float c[4];
+        if (xf[0x1026] == 0) { c[0] = fx(0x1020) * pos[0] + fx(0x1021) * pos[2]; c[1] = fx(0x1022) * pos[1] + fx(0x1023) * pos[2];
+                               c[2] = fx(0x1024) * pos[2] + fx(0x1025); c[3] = -pos[2]; }
+        else { c[0] = fx(0x1020) * pos[0] + fx(0x1021); c[1] = fx(0x1022) * pos[1] + fx(0x1023);
+               c[2] = fx(0x1024) * pos[2] + fx(0x1025); c[3] = 1; }
+        std::fprintf(lf, "%ld prim %02X n %u zm %X cm %X pix %X at %X ztex %X fog %X | vp %g %g %g %g %g %g | proj%u %g %g %g %g %g %g | "
+                     "mtx %u obj %g %g %g eye %g %g %g ndc %g %g w %g | tev %u chans %u\n",
+                     (long)cnt.draws, prim, n, bp[0x40], bp[0x41], bp[0x43], bp[0xF3], bp[0xF4], bp[0xF1],
+                     fx(0x101A), fx(0x101B), fx(0x101C), fx(0x101D), fx(0x101E), fx(0x101F),
+                     xf[0x1026], fx(0x1020), fx(0x1021), fx(0x1022), fx(0x1023), fx(0x1024), fx(0x1025),
+                     v0.mtx[0], v0.pos[0], v0.pos[1], v0.pos[2], pos[0], pos[1], pos[2], c[0] / c[3], c[1] / c[3], c[3],
+                     (bp[0x00] >> 10 & 15) + 1, xf[0x1009] & 3);
+    }
+    size_t bytes = (size_t)n * sizeof(GVtx);
+    // a draw never straddles two quarters; offsets stay whole vertices
+    size_t q = vbo_off / VBO_QUARTER;
+    if ((vbo_off + bytes - 1) / VBO_QUARTER != q) {          // on to the next quarter: fence this one
+        vbo_fence[q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        q = (q + 1) % 4;
+        vbo_off = (q * VBO_QUARTER + sizeof(GVtx) - 1) / sizeof(GVtx) * sizeof(GVtx);
+        if (vbo_fence[q]) {
+            glClientWaitSync(vbo_fence[q], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            glDeleteSync(vbo_fence[q]);
+            vbo_fence[q] = nullptr;
+        }
+    }
+    GLint base = (GLint)(vbo_off / sizeof(GVtx));
+    static std::vector<GLint> firsts;
+    static std::vector<GLsizei> counts;
+    static std::vector<const void*> offsets;
+    firsts.clear();
+    counts.clear();
+    for (uint32_t i = 0, at = 0, k; i < npieces; ++i) {       // the pieces' vertices, one after another
+        std::memcpy(&k, pieces, 4);
+        if(driver_vertex_upload){
+            if(vertex_staging.size()<bytes)vertex_staging.resize(bytes);
+            std::memcpy(vertex_staging.data()+(size_t)at*sizeof(GVtx),pieces+4,(size_t)k*sizeof(GVtx));
+        }else std::memcpy(vbo_ptr+vbo_off+(size_t)at*sizeof(GVtx),pieces+4,(size_t)k*sizeof(GVtx));
+        firsts.push_back(base + (GLint)at);
+        counts.push_back((GLsizei)k);
+        pieces += 4 + (size_t)k * sizeof(GVtx);
+        at += k;
+    }
+    if(driver_vertex_upload)glNamedBufferSubData(vbo,vbo_off,bytes,vertex_staging.data());
+    vbo_off += bytes;
+    GLenum mode;
+    switch (prim) {
+    case 0x80: case 0x88:                                      // quads: a static index buffer of their triangles
+        for (GLsizei& k : counts) k = k / 4 * 6;
+        offsets.assign(npieces, nullptr);
+        if (npieces == 1) glDrawElementsBaseVertex(GL_TRIANGLES, counts[0], GL_UNSIGNED_INT, nullptr, base);
+        else glMultiDrawElementsBaseVertex(GL_TRIANGLES, counts.data(), GL_UNSIGNED_INT, offsets.data(),
+                                           (GLsizei)npieces, firsts.data());
+        mode = 0;
+        break;
+    case 0x90: mode = GL_TRIANGLES; break;
+    case 0x98: mode = GL_TRIANGLE_STRIP; break;
+    case 0xA0: mode = GL_TRIANGLE_FAN; break;
+    case 0xA8: mode = GL_LINES; break;
+    case 0xB0: mode = GL_LINE_STRIP; break;
+    default: mode = GL_POINTS; break;
+    }
+    if (mode && npieces == 1) glDrawArrays(mode, base, counts[0]);
+    else if (mode) glMultiDrawArrays(mode, firsts.data(), counts.data(), (GLsizei)npieces);
+    if (efb_dump_every && efb_dumping()) {
+        static long k = 0;
+        if (++k % efb_dump_every == 0) {
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "draw%05ld", k);
+            efb_dump(tag);
+        }
+    }
+}
+
+// ---- the record -----------------------------------------------------------------------------------
+template <class T> T rd(const uint8_t*& p) { T v; std::memcpy(&v, p, sizeof v); p += sizeof v; return v; }
+
+// The EFB at its native size: the pixel at each native position's top-left
+// sample of the scaled EFB (rows from the top, as the EFB copies read it).
+void efb_readback() {
+    int W = EFB_W * S, H = EFB_H * S;
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    std::vector<float> dz((size_t)W * H);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, efb_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glReadPixels(0, 0, W, H, GL_DEPTH_COMPONENT, GL_FLOAT, dz.data());
+    std::lock_guard<std::mutex> lk(rb_mx);
+    rb_argb->resize((size_t)EFB_W * EFB_H);
+    rb_z->resize((size_t)EFB_W * EFB_H);
+    for (int y = 0; y < EFB_H; ++y)
+        for (int x = 0; x < EFB_W; ++x) {
+            size_t s = (size_t)y * S * W + (size_t)x * S, d = (size_t)y * EFB_W + x;
+            const uint8_t* c = &px[s * 4];
+            (*rb_argb)[d] = (uint32_t)c[3] << 24 | (uint32_t)c[0] << 16 | (uint32_t)c[1] << 8 | c[2];
+            (*rb_z)[d] = (uint32_t)(std::clamp(dz[s], 0.0f, 1.0f) * 16777215.0f);
+        }
+    rb_ready = true;
+    rb_cv.notify_all();
+}
+
+// An EFB copy to texture at its native size: the top-left sample of each
+// native pixel of the scaled copy (rows from the top, as it was copied).
+void copy_readback(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(rb_mx);
+    rb_rgba->assign((size_t)rb_w * rb_h * 4, 0);
+    auto it = efb_copies.find(addr);
+    if (it != efb_copies.end() && it->second.name) {
+        const Tex& t = it->second;
+        std::vector<uint8_t> px((size_t)t.w * t.h * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTextureImage(t.name, 0, GL_RGBA, GL_UNSIGNED_BYTE, (GLsizei)px.size(), px.data());
+        for (int y = 0; y < rb_h && y * S < t.h; ++y)
+            for (int x = 0; x < rb_w && x * S < t.w; ++x)
+                std::memcpy(&(*rb_rgba)[((size_t)y * rb_w + x) * 4], &px[((size_t)y * S * t.w + (size_t)x * S) * 4], 4);
+    }
+    rb_ready = true;
+    rb_cv.notify_all();
+}
+
+void exec(const std::vector<uint8_t>& data) {
+    const uint8_t* p = data.data();
+    const uint8_t* end = p + data.size();
+    while (p < end) {
+        switch (*p++) {
+        case VC_BP: bp_set(rd<uint32_t>(p)); break;
+        case VC_XF: {
+            uint16_t a = rd<uint16_t>(p), n = rd<uint16_t>(p);
+            std::memcpy(&xf[a], p, 4u * n);
+            p += 4u * n;
+            xf_lo = std::min<uint32_t>(xf_lo, a);
+            xf_hi = std::max<uint32_t>(xf_hi, a + n);
+            break;
+        }
+        case VC_DRAW: {
+            uint8_t prim = rd<uint8_t>(p), fl = rd<uint8_t>(p);
+            uint32_t pieces = rd<uint32_t>(p);
+            draw(prim, fl, p, pieces);
+            for (uint32_t i = 0; i < pieces; ++i) {
+                uint32_t n = rd<uint32_t>(p);
+                p += (size_t)n * sizeof(GVtx);
+            }
+            break;
+        }
+        case VC_TEXUP: {
+            uint8_t m = rd<uint8_t>(p);
+            uint32_t id = rd<uint32_t>(p);
+            int w = rd<uint16_t>(p), h = rd<uint16_t>(p), levels = rd<uint8_t>(p);
+            Tex& t = texs[id];
+            ensure_tex(t, w, h, levels);
+            for (int l = 0; l < levels; ++l) {
+                int lw = std::max(1, w >> l), lh = std::max(1, h >> l);
+                glTextureSubImage2D(t.name, l, 0, 0, lw, lh, GL_RGBA, GL_UNSIGNED_BYTE, p);
+                p += (size_t)lw * lh * 4;
+            }
+            map_src[m] = id;
+            break;
+        }
+        case VC_TEXBIND: { uint8_t m = rd<uint8_t>(p); map_src[m] = rd<uint32_t>(p); break; }
+        case VC_TEXEFB: { uint8_t m = rd<uint8_t>(p); map_src[m] = 1ull << 32 | rd<uint32_t>(p); break; }
+        case VC_FRAME: break;
+        case VC_DRAWDONE: gx_draw_done_reached(); break;
+        default: rt_die("video: bad record byte %02X", p[-1]);
+        }
+    }
+}
+
+// ---- presenting -----------------------------------------------------------------------------------
+uint32_t crc_table[256];
+uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
+    if (!crc_table[1])
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t k = i;
+            for (int j = 0; j < 8; ++j) k = k & 1 ? 0xEDB88320u ^ (k >> 1) : k >> 1;
+            crc_table[i] = k;
+        }
+    for (size_t i = 0; i < n; ++i) c = crc_table[(c ^ p[i]) & 255] ^ (c >> 8);
+    return c;
+}
+
+}  // namespace
+
+// a PNG with stored (uncompressed) deflate blocks
+void write_png(const std::string& path, int w, int h, const uint8_t* rgba) {
+    std::vector<uint8_t> raw;
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgba + (size_t)y * w * 4, rgba + (size_t)(y + 1) * w * 4);
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    uint32_t a = 1, b = 0;
+    for (uint8_t c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    for (size_t off = 0; off < raw.size() || off == 0;) {
+        size_t n = std::min<size_t>(65535, raw.size() - off);
+        z.push_back(off + n == raw.size() ? 1 : 0);
+        z.push_back((uint8_t)n); z.push_back((uint8_t)(n >> 8));
+        z.push_back((uint8_t)~n); z.push_back((uint8_t)(~n >> 8));
+        z.insert(z.end(), raw.begin() + (ptrdiff_t)off, raw.begin() + (ptrdiff_t)(off + n));
+        off += n;
+        if (off == raw.size()) break;
+    }
+    uint32_t ad = b << 16 | a;
+    for (int i = 3; i >= 0; --i) z.push_back((uint8_t)(ad >> (8 * i)));
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    auto be = [&](uint32_t v) { uint8_t t[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+                                std::fwrite(t, 1, 4, f); };
+    auto chunk = [&](const char* type, const std::vector<uint8_t>& d) {
+        be((uint32_t)d.size());
+        std::vector<uint8_t> td(type, type + 4);
+        td.insert(td.end(), d.begin(), d.end());
+        std::fwrite(td.data(), 1, td.size(), f);
+        be(crc32(td.data(), td.size()) ^ 0xFFFFFFFFu);
+    };
+    std::fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    std::vector<uint8_t> ihdr = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                                 (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h,
+                                 8, 6, 0, 0, 0};
+    chunk("IHDR", ihdr);
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    std::fclose(f);
+}
+
+namespace {
+
+// Where the picture sits in a window of w x h (pixels or window units): the
+// TV's screen, 4:3 or 16:9 as SYSCONF says, as large as the window allows and
+// centred; of its 480 lines (NTSC) VI scans the XFB out over its active ones,
+// centred too (360 for a game letterboxing 16:9 on a 4:3 screen).
+struct Rect { float x, y, w, h; };
+Rect picture_rect(float w, float h) {
+    float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
+    float sw = w, sh = w / aspect;
+    if (sh > h) { sh = h; sw = h * aspect; }
+    float ph = sh * (float)std::min<uint32_t>(vi_lines.load(), 480) / 480;
+    return {(w - sw) / 2, (h - ph) / 2, sw, ph};
+}
+
+// The Wii Remote on the mouse and the keyboard. The mouse over the picture
+// is the pointer; the buttons come from a key file (--keys, keys.txt next to
+// the extracted disc by default), written with the defaults when there is
+// none. Home has no key: Esc opens the port's own menu (video_run) instead
+// of the Wii's; F11 and Alt+Enter switch fullscreen. The file's
+// [Classic Controller] section does the same for the Classic Controller
+// (video_classic); a file without one takes the defaults' for it.
+// a key or a mouse button (mask); drag: only while the mouse moves fast with the button held;
+// classic: bits are the Classic's (KPAD's bits, and the sticks' directions from kStick)
+struct Binding { SDL_Scancode key; uint32_t mouse; uint32_t bits; bool shake; bool drag; bool classic; };
+// not Remote buttons: the Remote raised, pointing up (PadState::tilt)
+constexpr uint32_t kRaisePlus = 1u << 24, kRaiseMinus = 1u << 25;
+constexpr uint32_t kWalk = 1u << 26;                // the Nunchuk's stick at half its travel
+// the Classic's buttons (KPAD_CL_*), and its sticks pushed to the full by a key
+enum : uint32_t { CL_UP = 0x0001, CL_LEFT = 0x0002, CL_ZR = 0x0004, CL_X = 0x0008, CL_A = 0x0010,
+                  CL_Y = 0x0020, CL_B = 0x0040, CL_ZL = 0x0080, CL_R = 0x0200, CL_PLUS = 0x0400,
+                  CL_HOME = 0x0800, CL_MINUS = 0x1000, CL_L = 0x2000, CL_DOWN = 0x4000, CL_RIGHT = 0x8000 };
+constexpr uint32_t kStick = 1u << 16;               // L up, down, left, right, then R's: kStick << 0..7
+std::vector<Binding> bindings;
+int keys_input = INPUT_MODE_AUTO;                        // the key file's Input
+bool face_by_label = false;                         // the key file's Face Buttons = Label
+float dead_zone = 0.15f;                            // the key file's Dead Zone: of the sticks' travel, radial
+
+const char* DEFAULT_KEYS =
+    "# wiiboot's keys: each Wii Remote button, then the keys and mouse buttons that press it.\n"
+    "# Keys by SDL's names (https://wiki.libsdl.org/SDL3/SDL_Scancode): A..Z, 0..9, Return,\n"
+    "# Space, Tab, Backspace, Left Shift, Up, Down, Left, Right, Keypad Enter, F1..F10...\n"
+    "# Mouse buttons: Mouse Left, Mouse Right, Mouse Middle, Mouse X1, Mouse X2; Drag Left, Drag Right,\n"
+    "# Drag Middle: the button held and the mouse moving fast (a swing: Shake = Drag Left).\n"
+    "# Fixed: Esc (the pause box), F11 and Alt+Enter (fullscreen), F12 (trace a frame's GX commands). Delete the file for the defaults.\n"
+    "A     = Return, Keypad Enter, Mouse Right\n"
+    "B     = Mouse Left, Backspace\n"
+    "Up    = Up\n"
+    "Down  = Down\n"
+    "Left  = Left\n"
+    "Right = Right\n"
+    "Plus  = Tab\n"
+    "Minus = Q\n"
+    "1     = 1\n"
+    "2     = 2\n"
+    "Shake = Mouse Middle\n"
+    "C = Space\n"
+    "Z = Left Shift\n"
+    "Stick Up = W\n"
+    "Stick Down = S\n"
+    "Stick Left = A\n"
+    "Stick Right = D\n"
+    "\n"
+    "[Classic Controller]\n"
+    "# For a game that plays with the Classic Controller: its buttons and sticks on keys and mouse buttons.\n"
+    "# A gamepad is a Classic Controller too, on the channels in the order the pads are plugged in. Channel 1\n"
+    "# takes the keys, the mouse and the first pad at once (Input = Pad or Keyboard: only one of them;\n"
+    "# wiiboot --input says the same).\n"
+    "# The pad: its triggers are ZL and ZR, its shoulders L and R, Start +, Back -, its guide button Home.\n"
+    "# Face Buttons = Position: the right one is A, the bottom one B, the top one X, the left one Y (the\n"
+    "# Classic's own layout); Label: the button labelled A (Cross) is A, B (Circle) B, X (Square) X, Y (Triangle) Y.\n"
+    "# Dead Zone: how far the pad's sticks move before they count, of their travel.\n"
+    "Input        = Auto\n"
+    "Face Buttons = Position\n"
+    "Dead Zone    = 0.15\n"
+    "A     = Return, Space\n"
+    "B     = Backspace, C\n"
+    "X     = R\n"
+    "Y     = F\n"
+    "L     = Left Shift\n"
+    "R     = E\n"
+    "ZL    = Mouse Right\n"
+    "ZR    = Mouse Left\n"
+    "Plus  = Tab\n"
+    "Minus = Q\n"
+    "Home  = H\n"
+    "Up    = Up\n"
+    "Down  = Down\n"
+    "Left  = Left\n"
+    "Right = Right\n"
+    "Left Stick Up    = W\n"
+    "Left Stick Down  = S\n"
+    "Left Stick Left  = A\n"
+    "Left Stick Right = D\n"
+    "Right Stick Up    =\n"
+    "Right Stick Down  =\n"
+    "Right Stick Left  =\n"
+    "Right Stick Right =\n";
+
+std::string trim(const std::string& t) {
+    size_t a = t.find_first_not_of(" \t\r"), b = t.find_last_not_of(" \t\r");
+    return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+}
+
+// The bindings of a key file's text: the Remote's lines (before any section,
+// or under [Wii Remote]) if remote, the [Classic Controller] section's if
+// classic. True if the text has a Classic section.
+bool parse_keys(const std::string& text, const std::string& path, bool remote, bool classic) {
+    struct Btn { const char* name; uint32_t bits; };
+    static const Btn buttons[] = {{"A", 0x0800}, {"B", 0x0400}, {"Up", 0x0008}, {"Down", 0x0004},
+                                  {"Left", 0x0001}, {"Right", 0x0002}, {"Plus", 0x0010}, {"Minus", 0x1000},
+                                  {"1", 0x0200}, {"2", 0x0100}, {"Shake", 0},
+                                  {"Raise", kRaisePlus}, {"Raise Alt", kRaiseMinus},
+                                  {"C", 0x4000}, {"Z", 0x2000},                  // the Nunchuk's
+                                  {"Stick Up", kStick << 0}, {"Stick Down", kStick << 1},
+                                  {"Stick Left", kStick << 2}, {"Stick Right", kStick << 3}, {"Walk", kWalk}};
+    static const Btn cl_buttons[] = {{"A", CL_A}, {"B", CL_B}, {"X", CL_X}, {"Y", CL_Y}, {"L", CL_L}, {"R", CL_R},
+                                     {"ZL", CL_ZL}, {"ZR", CL_ZR}, {"Plus", CL_PLUS}, {"Minus", CL_MINUS},
+                                     {"Home", CL_HOME}, {"Up", CL_UP}, {"Down", CL_DOWN}, {"Left", CL_LEFT},
+                                     {"Right", CL_RIGHT},
+                                     {"Left Stick Up", kStick << 0}, {"Left Stick Down", kStick << 1},
+                                     {"Left Stick Left", kStick << 2}, {"Left Stick Right", kStick << 3},
+                                     {"Right Stick Up", kStick << 4}, {"Right Stick Down", kStick << 5},
+                                     {"Right Stick Left", kStick << 6}, {"Right Stick Right", kStick << 7}};
+    static const Btn mice[] = {{"Mouse Left", SDL_BUTTON_LMASK}, {"Mouse Right", SDL_BUTTON_RMASK},
+                               {"Mouse Middle", SDL_BUTTON_MMASK}, {"Mouse X1", SDL_BUTTON_X1MASK},
+                               {"Mouse X2", SDL_BUTTON_X2MASK}};
+    bool in_classic = false, has_classic = false;
+    size_t start = 0;
+    for (int line = 1; start < text.size(); ++line) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        std::string l = trim(text.substr(start, end - start));
+        start = end + 1;
+        if (l.empty() || l[0] == '#') continue;
+        if (l[0] == '[') {
+            std::string sec = trim(l.substr(1, l.find(']') - 1));
+            in_classic = SDL_strcasecmp(sec.c_str(), "Classic Controller") == 0 || SDL_strcasecmp(sec.c_str(), "Classic") == 0;
+            has_classic |= in_classic;
+            if (!in_classic && SDL_strcasecmp(sec.c_str(), "Wii Remote") != 0 && SDL_strcasecmp(sec.c_str(), "Remote") != 0)
+                rt_log("video: %s:%d: no section [%s] ([Wii Remote], [Classic Controller])", path.c_str(), line, sec.c_str());
+            continue;
+        }
+        if (in_classic ? !classic : !remote) continue;
+        size_t eq = l.find('=');
+        std::string lhs = eq == std::string::npos ? l : trim(l.substr(0, eq));
+        std::string rest = eq == std::string::npos ? std::string() : trim(l.substr(eq + 1));
+        if (in_classic && eq != std::string::npos) {                   // the section's settings
+            if (SDL_strcasecmp(lhs.c_str(), "Input") == 0) {
+                static const char* names[] = {"Auto", "Pad", "Keyboard"};
+                int v = -1;
+                for (int i = 0; i < 3; ++i)
+                    if (SDL_strcasecmp(rest.c_str(), names[i]) == 0) v = i;
+                if (v < 0) rt_log("video: %s:%d: Input is Auto, Pad or Keyboard", path.c_str(), line);
+                else keys_input = v;
+                continue;
+            }
+            if (SDL_strcasecmp(lhs.c_str(), "Face Buttons") == 0) {
+                if (SDL_strcasecmp(rest.c_str(), "Label") == 0) face_by_label = true;
+                else if (SDL_strcasecmp(rest.c_str(), "Position") == 0) face_by_label = false;
+                else rt_log("video: %s:%d: Face Buttons is Position or Label", path.c_str(), line);
+                continue;
+            }
+            if (SDL_strcasecmp(lhs.c_str(), "Dead Zone") == 0) {
+                dead_zone = std::clamp((float)std::atof(rest.c_str()), 0.0f, 0.9f);
+                continue;
+            }
+        }
+        const Btn* b = nullptr;
+        if (eq != std::string::npos) {
+            if (in_classic) {
+                for (const Btn& c : cl_buttons)
+                    if (SDL_strcasecmp(lhs.c_str(), c.name) == 0) b = &c;
+            } else {
+                for (const Btn& c : buttons)
+                    if (SDL_strcasecmp(lhs.c_str(), c.name) == 0) b = &c;
+            }
+        }
+        if (!b) {
+            if (in_classic) rt_log("video: %s:%d: not a Classic Controller button (A B X Y L R ZL ZR Plus Minus Home Up Down Left Right, "
+                                   "Left Stick Up..., Right Stick Up...) or setting (Input, Face Buttons, Dead Zone)", path.c_str(), line);
+            else rt_log("video: %s:%d: not a Remote button (A B Up Down Left Right Plus Minus 1 2 Shake Raise; the Nunchuk's "
+                        "C Z Stick Up/Down/Left/Right Walk)", path.c_str(), line);
+            continue;
+        }
+        for (size_t p = 0; p <= rest.size();) {
+            size_t q = rest.find(',', p);
+            if (q == std::string::npos) q = rest.size();
+            std::string name = trim(rest.substr(p, q - p));
+            p = q + 1;
+            if (name.empty()) continue;
+            Binding k{SDL_SCANCODE_UNKNOWN, 0, b->bits, !in_classic && b->bits == 0, false, in_classic};
+            for (const Btn& m : mice)
+                if (SDL_strcasecmp(name.c_str(), m.name) == 0) k.mouse = m.bits;
+            static const Btn drags[] = {{"Drag Left", SDL_BUTTON_LMASK}, {"Drag Right", SDL_BUTTON_RMASK},
+                                        {"Drag Middle", SDL_BUTTON_MMASK}};
+            for (const Btn& m : drags)
+                if (SDL_strcasecmp(name.c_str(), m.name) == 0) { k.mouse = m.bits; k.drag = true; }
+            if (!k.mouse) k.key = SDL_GetScancodeFromName(name.c_str());
+            if (!k.mouse && k.key == SDL_SCANCODE_UNKNOWN) { rt_log("video: %s:%d: no key named \"%s\"", path.c_str(), line, name.c_str()); continue; }
+            bindings.push_back(k);
+        }
+    }
+    return has_classic;
+}
+
+void load_keys(const std::string& path) {
+    std::string text;
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        char buf[4096];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+    } else {
+        text = DEFAULT_KEYS;
+        if (FILE* out = std::fopen(path.c_str(), "wb")) {
+            std::fputs(DEFAULT_KEYS, out);
+            std::fclose(out);
+            rt_log("video: wrote the default keys to %s", path.c_str());
+        }
+    }
+    bindings.clear();
+    if (!parse_keys(text, path, true, true)) parse_keys(DEFAULT_KEYS, "(the default keys)", false, true);
+}
+
+// ---- gamepads, as Classic Controllers ----------------------------------------------------------
+// A pad keeps its channel while it stays plugged in; a new one takes the
+// lowest free channel (from channel 2 with Input = Keyboard, channel 1 being
+// the keyboard's alone).
+SDL_Gamepad* chan_pad[4] = {};
+std::atomic<bool> rumble_want[4];
+int input_mode() { return opt.input >= 0 ? opt.input : keys_input; }
+
+void pad_added(SDL_JoystickID id) {
+    for (SDL_Gamepad* g : chan_pad)
+        if (g && SDL_GetGamepadID(g) == id) return;
+    int first = input_mode() == INPUT_MODE_KEYBOARD ? 1 : 0, chan = -1;
+    for (int i = first; i < 4 && chan < 0; ++i)
+        if (!chan_pad[i]) chan = i;
+    if (chan < 0) { rt_log("video: a fifth pad (%s): no channel for it", SDL_GetGamepadNameForID(id)); return; }
+    SDL_Gamepad* g = SDL_OpenGamepad(id);
+    if (!g) { rt_log("video: pad %s: %s", SDL_GetGamepadNameForID(id), SDL_GetError()); return; }
+    chan_pad[chan] = g;
+    rt_log("video: pad \"%s\" (%s) on channel %d%s", SDL_GetGamepadName(g),
+           SDL_GetGamepadStringForType(SDL_GetGamepadType(g)), chan + 1,
+           chan == 0 && input_mode() == INPUT_MODE_AUTO ? ", with the keyboard and the mouse" : "");
+}
+
+void pad_removed(SDL_JoystickID id) {
+    for (int i = 0; i < 4; ++i)
+        if (chan_pad[i] && SDL_GetGamepadID(chan_pad[i]) == id) {
+            rt_log("video: pad \"%s\" off channel %d", SDL_GetGamepadName(chan_pad[i]), i + 1);
+            SDL_CloseGamepad(chan_pad[i]);
+            chan_pad[i] = nullptr;
+        }
+}
+
+float axis(SDL_Gamepad* g, SDL_GamepadAxis a) { return std::clamp(SDL_GetGamepadAxis(g, a) / 32767.0f, -1.0f, 1.0f); }
+
+// a stick through the dead zone (radial, the rest of the travel rescaled to
+// 0..1), y up
+void stick(SDL_Gamepad* g, SDL_GamepadAxis ax, SDL_GamepadAxis ay, float& x, float& y) {
+    x = axis(g, ax);
+    y = -axis(g, ay);
+    float m = std::hypot(x, y);
+    float k = m <= dead_zone ? 0.0f : std::min(1.0f, (m - dead_zone) / (1 - dead_zone)) / m;
+    x *= k;
+    y *= k;
+}
+
+ClassicState classic_from_pad(SDL_Gamepad* g) {
+    ClassicState s;
+    s.connected = true;
+    static const struct { SDL_GamepadButton b; uint32_t bit; } fixed[] = {
+        {SDL_GAMEPAD_BUTTON_DPAD_UP, CL_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, CL_DOWN},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, CL_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, CL_RIGHT},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, CL_L}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, CL_R},
+        {SDL_GAMEPAD_BUTTON_START, CL_PLUS}, {SDL_GAMEPAD_BUTTON_BACK, CL_MINUS}, {SDL_GAMEPAD_BUTTON_GUIDE, CL_HOME}};
+    for (auto& f : fixed)
+        if (SDL_GetGamepadButton(g, f.b)) s.buttons |= f.bit;
+    // the face buttons: by position, the Classic's own layout (A right, B
+    // bottom, X top, Y left), or by the pad's labels
+    static const struct { SDL_GamepadButton b; uint32_t pos; } face[] = {
+        {SDL_GAMEPAD_BUTTON_EAST, CL_A}, {SDL_GAMEPAD_BUTTON_SOUTH, CL_B},
+        {SDL_GAMEPAD_BUTTON_NORTH, CL_X}, {SDL_GAMEPAD_BUTTON_WEST, CL_Y}};
+    for (auto& f : face) {
+        if (!SDL_GetGamepadButton(g, f.b)) continue;
+        uint32_t bit = f.pos;
+        if (face_by_label) switch (SDL_GetGamepadButtonLabel(g, f.b)) {
+            case SDL_GAMEPAD_BUTTON_LABEL_A: case SDL_GAMEPAD_BUTTON_LABEL_CROSS: bit = CL_A; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_B: case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: bit = CL_B; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_X: case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: bit = CL_X; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_Y: case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: bit = CL_Y; break;
+            default: break;
+        }
+        s.buttons |= bit;
+    }
+    // the triggers are ZL and ZR (the Classic Controller Pro's place for
+    // them); L and R, digital on the Pro, report their analog value full
+    if (axis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 0.5f) s.buttons |= CL_ZL;
+    if (axis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 0.5f) s.buttons |= CL_ZR;
+    s.lt = s.buttons & CL_L ? 1.0f : 0.0f;
+    s.rt = s.buttons & CL_R ? 1.0f : 0.0f;
+    stick(g, SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, s.lx, s.ly);
+    stick(g, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, s.rx, s.ry);
+    return s;
+}
+
+// channel 1's two sources as one: buttons OR'd, each stick the one deflected
+// more (never summed: WASD and the stick together are no faster)
+void merge(ClassicState& a, const ClassicState& b) {
+    a.connected |= b.connected;
+    a.buttons |= b.buttons;
+    if (std::hypot(b.lx, b.ly) > std::hypot(a.lx, a.ly)) { a.lx = b.lx; a.ly = b.ly; }
+    if (std::hypot(b.rx, b.ry) > std::hypot(a.rx, a.ry)) { a.rx = b.rx; a.ry = b.ry; }
+    a.lt = std::max(a.lt, b.lt);
+    a.rt = std::max(a.rt, b.rt);
+}
+
+// the Remote's motor on the channel's pad: on and off as the game asks,
+// renewed while it stays on (SDL's rumble lasts as long as it is told)
+void update_rumble() {
+    static bool on[4];
+    static Clock::time_point renewed[4];
+    auto now = Clock::now();
+    for (int i = 0; i < 4; ++i) {
+        bool want = rumble_want[i].load() && chan_pad[i];
+        if (want && (!on[i] || now - renewed[i] > std::chrono::milliseconds(500))) {
+            SDL_RumbleGamepad(chan_pad[i], 0x6000, 0xA000, 1000);
+            renewed[i] = now;
+        } else if (!want && on[i] && chan_pad[i]) {
+            SDL_RumbleGamepad(chan_pad[i], 0, 0, 0);
+        }
+        on[i] = want;
+    }
+}
+
+void update_pad() {
+    const bool* ks = SDL_GetKeyboardState(nullptr);
+    PadState p;
+    bool alt = SDL_GetModState() & SDL_KMOD_ALT;           // Alt+Enter is fullscreen, nothing else
+    float mx = 0, my = 0;
+    SDL_MouseButtonFlags mb = SDL_GetMouseState(&mx, &my);
+    // the mouse's speed, in window heights a second over the last 40 ms or so;
+    // a drag counts from kDragSpeed, and lasts kDragHold after it slows
+    // down, so that a quick flick still gives the game a few samples
+    constexpr float kDragSpeed = 1.5f;
+    constexpr double kDragHold = 0.12;
+    static float lx = mx, ly = my, speed = 0;
+    static Clock::time_point lt = Clock::now(), drag_until{};
+    {
+        auto now = Clock::now();
+        double dt = std::chrono::duration<double>(now - lt).count();
+        int ww0 = 0, wh0 = 0;
+        SDL_GetWindowSize(win, &ww0, &wh0);
+        if (dt > 0.002 && wh0 > 0) {
+            float v = std::hypot(mx - lx, my - ly) / (float)wh0 / (float)dt;
+            float a = (float)std::min(1.0, dt / 0.04);
+            speed += (v - speed) * a;
+            lx = mx; ly = my; lt = now;
+            if (speed > kDragSpeed)
+                drag_until = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kDragHold));
+        }
+    }
+    bool dragging = Clock::now() < drag_until;
+    uint32_t cl = 0;                                          // the Classic's buttons and stick directions from keys
+    for (const Binding& k : bindings) {
+        bool down = k.mouse ? (mb & k.mouse) != 0 && (!k.drag || dragging)
+                            : ks[k.key] && !(alt && (k.key == SDL_SCANCODE_RETURN || k.key == SDL_SCANCODE_KP_ENTER));
+        if (!down) continue;
+        if (k.classic) { cl |= k.bits; continue; }
+        p.buttons |= k.bits;
+        if (k.shake) p.shake = true;
+        if (k.bits & kRaisePlus) p.tilt = 1;
+        if (k.bits & kRaiseMinus) p.tilt = -1;
+    }
+    // the Nunchuk's stick from keys (kStick << 0..3 are free among the Remote's bits)
+    {
+        auto dir = [&](int i) { return p.buttons & (kStick << i) ? 1.0f : 0.0f; };
+        p.sx = dir(3) - dir(2);
+        p.sy = dir(0) - dir(1);
+        if (p.sx && p.sy) { p.sx *= 0.7071f; p.sy *= 0.7071f; }
+        if (p.buttons & kWalk) { p.sx *= 0.5f; p.sy *= 0.5f; }
+    }
+    p.buttons &= ~(kRaisePlus | kRaiseMinus | kWalk | (kStick * 0xF));
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(win, &ww, &wh);                        // mouse coordinates are in window units
+    if (ww > 0 && wh > 0 && (SDL_GetWindowFlags(win) & SDL_WINDOW_MOUSE_FOCUS)) {
+        // -1..1 spans the picture as present() shows it, so that the game's
+        // cursor lands under the mouse
+        Rect r = picture_rect((float)ww, (float)wh);
+        p.x = (mx - r.x) / r.w * 2 - 1;
+        p.y = (my - r.y) / r.h * 2 - 1;
+        p.pointer = p.x >= -1 && p.x <= 1 && p.y >= -1 && p.y <= 1;
+    }
+    // over the picture the game draws its own cursor, as on the Wii
+    static bool hidden = false;
+    if (p.pointer != hidden) {
+        hidden = p.pointer;
+        if (hidden) SDL_HideCursor(); else SDL_ShowCursor();
+    }
+    // WIIKIT_PAD="45:A 50.5:@0.2,-0.1 51:A": at each time (seconds from
+    // start) press buttons for 150 ms (A B 1 2 + - H U D L R C Z, X = shake), or
+    // move the pointer, which stays: reproducible runs for debugging
+    static const char* script = std::getenv("WIIKIT_PAD");
+    uint32_t scripted = 0;
+    static const Clock::time_point t0 = Clock::now();
+    static float sx = 0, sy = 0;
+    static bool spointer = false;
+    static bool script_stick = false;
+    static float script_sx = 0, script_sy = 0;
+    static double script_previous = -1;
+    if (script) {
+        double t = std::chrono::duration<double>(Clock::now() - t0).count();
+        for (const char* q = script; *q;) {
+            char* e;
+            double at = std::strtod(q, &e);
+            if (e == q || *e != ':') break;
+            q = e + 1;
+            if (*q == '%') {
+                float x=std::strtof(q+1,&e),y=std::strtof(e+1,&e);
+                if(t>=at){script_sx=std::clamp(x,-1.0f,1.0f);script_sy=std::clamp(y,-1.0f,1.0f);script_stick=true;}
+                q=e;
+            } else if (*q == '@') {
+                float x = std::strtof(q + 1, &e), y = std::strtof(e + 1, &e);
+                if (t >= at) { sx = x; sy = y; spointer = true; }
+                q = e;
+            } else {
+                for (; *q && *q != ' '; ++q) {
+                    static const char names[] = "AB12+-HUDLRCZ";
+                    static const uint32_t bits[] = {0x0800, 0x0400, 0x0200, 0x0100, 0x0010, 0x1000,
+                                                    0x8000, 0x0008, 0x0004, 0x0001, 0x0002, 0x4000, 0x2000};
+                    const char* n = std::strchr(names, *q);
+                    if (n && t >= at && t < at + 0.15) scripted |= bits[n - names];
+                    if (n && at > script_previous && t >= at) pending_buttons.fetch_or(bits[n-names],std::memory_order_relaxed);
+                    if (*q == 'X' && t >= at && t < at + 0.15) p.shake = true;
+                }
+            }
+            while (*q == ' ') ++q;
+        }
+        if(script_stick){p.sx=script_sx;p.sy=script_sy;}
+        script_previous=t;
+        if (spointer && !p.pointer) { p.x = sx; p.y = sy; p.pointer = true; }
+    }
+    p.buttons |= scripted;
+    // the Classic Controllers: channel 1 the keys, the mouse's buttons and
+    // the script (its Remote buttons as the Classic's: 1 is X, 2 is Y),
+    // merged with its pad unless Input says one of them; the others their pads
+    ClassicState c[4];
+    int mode = input_mode();
+    if (mode != INPUT_MODE_PAD) {
+        static const uint32_t from_remote[][2] = {{0x0800, CL_A}, {0x0400, CL_B}, {0x0200, CL_X}, {0x0100, CL_Y},
+                                                  {0x0010, CL_PLUS}, {0x1000, CL_MINUS}, {0x8000, CL_HOME},
+                                                  {0x0008, CL_UP}, {0x0004, CL_DOWN}, {0x0001, CL_LEFT}, {0x0002, CL_RIGHT}};
+        for (auto& m : from_remote)
+            if (scripted & m[0]) cl |= m[1];
+        ClassicState& k = c[0];
+        k.connected = true;
+        k.buttons = cl & 0xFFFF;
+        auto dir = [&](int i) { return cl & (kStick << i) ? 1.0f : 0.0f; };
+        k.lx = dir(3) - dir(2);
+        k.ly = dir(0) - dir(1);
+        k.rx = dir(7) - dir(6);
+        k.ry = dir(4) - dir(5);
+        if (k.lx && k.ly) { k.lx *= 0.7071f; k.ly *= 0.7071f; }
+        if (k.rx && k.ry) { k.rx *= 0.7071f; k.ry *= 0.7071f; }
+        k.lt = k.buttons & CL_L ? 1.0f : 0.0f;
+        k.rt = k.buttons & CL_R ? 1.0f : 0.0f;
+    }
+    for (int i = 0; i < 4; ++i)
+        if (chan_pad[i] && !(i == 0 && mode == INPUT_MODE_KEYBOARD)) merge(c[i], classic_from_pad(chan_pad[i]));
+    update_rumble();
+    std::lock_guard<std::mutex> lk(pad_mx);
+    pad = p;
+    for (int i = 0; i < 4; ++i) classic[i] = c[i];
+}
+
+// Port settings. These operate on the same EFB used by the game's GX draws.
+bool outputLinear=true, hostVsync=false;
+void save_port_settings(){
+ FILE* f=std::fopen("star-successor-settings.ini","w");if(!f){rt_log("settings: cannot save");return;}
+ std::fprintf(f,"%d %d %d %d %d\n",opt.window_w,opt.window_h,S,int(outputLinear),int(hostVsync));std::fclose(f);
+}
+void resize_internal(int w,int h){
+ const int next=std::clamp((w+639)/640,1,6),previous=S;
+ if(next!=S){
+  GLuint oldCol=efb_col,oldDep=efb_dep;S=next;
+  glCreateTextures(GL_TEXTURE_2D,1,&efb_col);glTextureStorage2D(efb_col,1,GL_RGBA8,EFB_W*S,EFB_H*S);
+  glCreateTextures(GL_TEXTURE_2D,1,&efb_dep);glTextureStorage2D(efb_dep,1,GL_DEPTH_COMPONENT32F,EFB_W*S,EFB_H*S);
+  for(GLuint t:{efb_col,efb_dep}){glTextureParameteri(t,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTextureParameteri(t,GL_TEXTURE_MAG_FILTER,GL_NEAREST);}
+  glNamedFramebufferTexture(copy_fbo,GL_COLOR_ATTACHMENT0,oldCol,0);glNamedFramebufferTexture(copy_fbo,GL_DEPTH_ATTACHMENT,oldDep,0);
+  glNamedFramebufferTexture(efb_fbo,GL_COLOR_ATTACHMENT0,efb_col,0);glNamedFramebufferTexture(efb_fbo,GL_DEPTH_ATTACHMENT,efb_dep,0);
+  if(glCheckNamedFramebufferStatus(efb_fbo,GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)rt_die("settings: EFB allocation failed");
+  glDisable(GL_SCISSOR_TEST);
+  framebuffer_blit(copy_fbo,efb_fbo,0,0,EFB_W*previous,EFB_H*previous,0,0,EFB_W*S,EFB_H*S,GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT,GL_NEAREST);
+  glNamedFramebufferTexture(copy_fbo,GL_DEPTH_ATTACHMENT,0,0);glNamedFramebufferTexture(copy_fbo,GL_COLOR_ATTACHMENT0,0,0);
+  glDeleteTextures(1,&oldCol);glDeleteTextures(1,&oldDep);glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);
+ }
+ opt.window_w=w;opt.window_h=h;SDL_SetWindowSize(win,w,h);
+ save_port_settings();rt_log("settings: game EFB %dx%d, display target %dx%d",EFB_W*S,EFB_H*S,w,h);
+}
+int settings_box(const char* title,const char* message,const std::vector<SDL_MessageBoxButtonData>& buttons){
+ SDL_MessageBoxData box={SDL_MESSAGEBOX_INFORMATION,win,title,message,int(buttons.size()),buttons.data(),nullptr};
+ int choice=0;if(!SDL_ShowMessageBox(&box,&choice))rt_log("settings: %s",SDL_GetError());return choice;
+}
+bool port_menu(){
+ SDL_SetWindowRelativeMouseMode(win,false);
+ for(;;){
+  int choice=settings_box("Star Successor — Configuracoes","Configure a resolucao e as opcoes graficas do jogo.",{
+   {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,0,"Continuar"},{0,1,"Resolucao"},{0,2,"Renderizacao"},{0,3,"Tela cheia"},{0,4,"Controles"},{0,9,"Sair"}});
+  if(choice==0)return false;if(choice==9)return true;
+  if(choice==1){
+   int r=settings_box("Resolucao interna","Escolha a resolucao de exibicao. A escala interna do jogo acompanha a escolha (2x, 3x, 4x, 6x).",{
+    {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,0,"Voltar"},{0,1,"1280 x 720"},{0,2,"1920 x 1080"},{0,3,"2560 x 1440"},{0,4,"3840 x 2160 (4K)"}});
+   const int widths[]={0,1280,1920,2560,3840},heights[]={0,720,1080,1440,2160};if(r>=1&&r<=4)resize_internal(widths[r],heights[r]);
+  }else if(choice==2){
+   char info[512];std::snprintf(info,sizeof(info),"Interface grafica: OpenGL 4.5 (Vulkan quando Zink)\nGPU: %s\nResolucao interna: %d x %d (%dx)\nFiltro de exibicao: %s\nVSync: %s",glGetString(GL_RENDERER),EFB_W*S,EFB_H*S,S,outputLinear?"Linear":"Nearest",hostVsync?"Ligado":"Desligado");
+   int r=settings_box("Renderizacao",info,{{SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,0,"Voltar"},{0,1,"Alternar filtro"},{0,2,"Alternar VSync"}});
+   if(r==1)outputLinear=!outputLinear;
+   if(r==2){bool want=!hostVsync;if(SDL_GL_SetSwapInterval(want?1:0))hostVsync=want;else rt_log("settings: VSync unavailable: %s",SDL_GetError());}save_port_settings();
+  }else if(choice==3){SDL_SetWindowFullscreen(win,!(SDL_GetWindowFlags(win)&SDL_WINDOW_FULLSCREEN));
+  }else if(choice==4){settings_box("Teclado e mouse","Mira: mouse\nMovimento: W A S D\nBotao B: mouse esquerdo / Backspace\nBotao A: mouse direito / Enter\nBotao C: Espaco\nBotao Z: Shift esquerdo\nBotao + / pular introducao: Tab\nBotao 2 / ajuda: 2\nEsc: configuracoes\nF11 / Alt+Enter: tela cheia\nVinculos personalizados: keys.txt.",{{SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,0,"Voltar"}});}
+ }
+}
+
+void draw_presentation(const Tex& t,int dx,int dy,int dw,int dh){
+ glBindFramebuffer(GL_FRAMEBUFFER,0);compatDrawBuffer(GL_BACK);compatReadBuffer(GL_BACK);
+ glDisable(GL_SCISSOR_TEST);glDisable(GL_BLEND);glDisable(GL_COLOR_LOGIC_OP);glDisable(GL_DEPTH_TEST);glDisable(GL_CULL_FACE);glDisable(GL_STENCIL_TEST);
+ glColorMask(1,1,1,1);glViewport(dx,dy,dw,dh);
+ glUseProgram(present_prog);glBindTextureUnit(0,t.name);glBindSampler(0,present_sampler);
+ glSamplerParameteri(present_sampler,GL_TEXTURE_MIN_FILTER,outputLinear?GL_LINEAR:GL_NEAREST);
+ glSamplerParameteri(present_sampler,GL_TEXTURE_MAG_FILTER,outputLinear?GL_LINEAR:GL_NEAREST);
+ glBindVertexArray(empty_vao);glDrawArrays(GL_TRIANGLES,0,3);glBindVertexArray(vao);
+}
+void present_texture(const Tex& t,int dx,int dy,int dw,int dh){
+ if(std::getenv("STAR_PRESENT_BLIT")){
+  glNamedFramebufferTexture(copy_fbo,GL_COLOR_ATTACHMENT0,t.name,0);
+  framebuffer_blit(copy_fbo,0,0,0,t.w,t.h,dx,dy+dh,dx+dw,dy,GL_COLOR_BUFFER_BIT,outputLinear?GL_LINEAR:GL_NEAREST);
+ }else draw_presentation(t,dx,dy,dw,dh);
+}
+// Each attribute has an independent binding and a zero relative offset.
+// The Intel trace of the old shared binding returned position float bits as
+// matrix indices; do not mix integer and float fetch layouts on binding 0.
+const size_t vertex_offsets[13]={offsetof(GVtx,pos),offsetof(GVtx,nrm),offsetof(GVtx,bin),offsetof(GVtx,tan),offsetof(GVtx,col),offsetof(GVtx,col)+4,offsetof(GVtx,tc),offsetof(GVtx,tc)+16,offsetof(GVtx,tc)+32,offsetof(GVtx,tc)+48,offsetof(GVtx,mtx),offsetof(GVtx,mtx)+4,offsetof(GVtx,mtx)+8};
+void bind_vertex_stream(GLuint buffer){
+ for(GLuint a=0;a<13;++a)glVertexArrayVertexBuffer(vao,a,buffer,GLintptr(vertex_offsets[a]),sizeof(GVtx));
+}
+bool geometry_selftest(){
+ uint32_t testXf[0x1058]{};auto set=[&](unsigned i,float f){std::memcpy(testXf+i,&f,4);};
+ set(0,1);set(5,1);set(10,1);set(0x1020,1);set(0x1022,1);testXf[0x1026]=1;set(0x101F,8388608.0f);testXf[0x100C]=0xFF0000FFu;
+ uint32_t testBp[256]{};std::string vs,unused;gx_shader_gen(testBp,testXf,0,vs,unused);
+ const std::string simple=R"(#version 450 core
+layout(location=0) in vec3 position;void main(){gl_Position=vec4(position.xy,0.5,1.0);})";
+ const std::string red=R"(#version 450 core
+layout(location=0) out vec4 color;void main(){color=vec4(1,0,0,1);})";
+ const std::string ps=R"(#version 450 core
+layout(std140,binding=1) uniform PS {ivec4 reg[4];};layout(location=0) out vec4 color;void main(){color=vec4(reg[0])/255.0;})";
+ std::string legacy=vs;
+ const std::string storage="layout(std430, binding = 0) readonly buffer XFMem { uint xfWords[0x1058]; };\nuint XU(uint a) { return xfWords[a]; }";
+ const std::string uniform="layout(std140, binding = 0) uniform XFMem { uvec4 xf4[0x416]; };\nuint XU(uint a) { return xf4[a >> 2][a & 3u]; }";
+ const auto declaration=legacy.find(storage);
+ if(declaration==std::string::npos)rt_die("video: geometry probe XF declaration missing");
+ legacy.replace(declaration,storage.size(),uniform);
+ GLuint programsTest[4]={link(simple,red),link(vs,red),link(vs,ps),link(legacy,red)};
+ GVtx verts[4]{};const float xy[4][2]={{-.8f,-.8f},{.8f,-.8f},{.8f,.8f},{-.8f,.8f}};
+ for(int i=0;i<4;++i){verts[i].pos[0]=xy[i][0];verts[i].pos[1]=xy[i][1];}
+ GLuint buffers[2]{};glCreateBuffers(2,buffers);
+ glNamedBufferStorage(buffers[0],sizeof verts,verts,GL_DYNAMIC_STORAGE_BIT);
+ const GLbitfield flags=GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT|GL_MAP_COHERENT_BIT;
+ glNamedBufferStorage(buffers[1],sizeof verts,nullptr,flags);
+ void* mapped=glMapNamedBufferRange(buffers[1],0,sizeof verts,flags);if(mapped)std::memcpy(mapped,verts,sizeof verts);
+ glNamedBufferSubData(xf_ubo,0,sizeof testXf,testXf);
+ auto getBuffer=reinterpret_cast<PFNGLGETNAMEDBUFFERSUBDATAPROC>(SDL_GL_GetProcAddress("glGetNamedBufferSubData"));
+ if(std::getenv("STAR_GL_PROBE_READBACK")){uint32_t uploaded[0x1058]{};getBuffer(xf_ubo,0,sizeof uploaded,uploaded);
+ rt_log("graphics: XF upload readback=%s matrix=%08X projection=%08X type=%08X far=%08X",std::memcmp(uploaded,testXf,sizeof uploaded)==0?"MATCH":"MISMATCH",uploaded[0],uploaded[0x1020],uploaded[0x1026],uploaded[0x101F]);}
+ GLuint freshXf=0;
+ if(std::getenv("STAR_GL_PROBE_INITIAL_DATA")){glCreateBuffers(1,&freshXf);glNamedBufferStorage(freshXf,sizeof testXf,testXf,0);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,freshXf);glBindBufferBase(GL_UNIFORM_BUFFER,0,freshXf);}
+ if(std::getenv("STAR_GL_PROBE_REBIND")){glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,xf_ubo);glBindBufferBase(GL_UNIFORM_BUFFER,0,xf_ubo);}
+ PSUniforms testPs{};testPs.reg[0][0]=255;testPs.reg[0][3]=255;glNamedBufferSubData(ps_ubo,0,sizeof testPs,&testPs);
+ bool ok[6]{};const char* names[]={"driver-simple","driver-GX-XF-SSBO","driver-GX-XF-SSBO-PS","mapped-GX-XF-SSBO","driver-GX-SSBO-indexed","legacy-GX-XF-UBO"};
+ for(int i=0;i<6;++i){
+  glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);glDisable(GL_SCISSOR_TEST);glDisable(GL_BLEND);glDisable(GL_COLOR_LOGIC_OP);glDisable(GL_DEPTH_TEST);glDisable(GL_CULL_FACE);glColorMask(1,1,1,1);glViewport(0,0,64,64);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+  glBindVertexArray(vao);bind_vertex_stream(buffers[i==3?1:0]);
+  if(std::getenv("STAR_GL_PROBE_MINIMAL_ATTRIBUTES")){
+   auto disable=reinterpret_cast<PFNGLDISABLEVERTEXARRAYATTRIBPROC>(SDL_GL_GetProcAddress("glDisableVertexArrayAttrib"));for(unsigned a=1;a<10;++a)disable(vao,a);
+  }
+  GLuint program=programsTest[i==0?0:i==2?2:i==5?3:1];glUseProgram(program);
+  if(program&&(i!=3||mapped)){if(i==4)glDrawElementsBaseVertex(GL_TRIANGLES,6,GL_UNSIGNED_INT,nullptr,0);else glDrawArrays(GL_TRIANGLES,0,3);}
+  uint8_t pixel[4]{};glReadPixels(40,24,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);GLenum error=glGetError();ok[i]=program&&pixel[0]>240&&pixel[1]<8&&pixel[2]<8&&error==GL_NO_ERROR;
+  rt_log("graphics: geometry-selftest %s=%s pixel=%u,%u,%u,%u GLerror=%04X",names[i],ok[i]?"PASS":"FAIL",pixel[0],pixel[1],pixel[2],pixel[3],error);
+ }
+
+ if(std::getenv("STAR_GL_PROBE_TRACE")){
+  auto vary=reinterpret_cast<PFNGLTRANSFORMFEEDBACKVARYINGSPROC>(SDL_GL_GetProcAddress("glTransformFeedbackVaryings"));
+  auto begin=reinterpret_cast<PFNGLBEGINTRANSFORMFEEDBACKPROC>(SDL_GL_GetProcAddress("glBeginTransformFeedback"));
+  auto end=reinterpret_cast<PFNGLENDTRANSFORMFEEDBACKPROC>(SDL_GL_GetProcAddress("glEndTransformFeedback"));
+  auto read=reinterpret_cast<PFNGLGETNAMEDBUFFERSUBDATAPROC>(SDL_GL_GetProcAddress("glGetNamedBufferSubData"));
+  auto integer=reinterpret_cast<PFNGLGETINTEGERI_VPROC>(SDL_GL_GetProcAddress("glGetIntegeri_v"));
+  GLuint feedback=0;glCreateBuffers(1,&feedback);glNamedBufferStorage(feedback,3*12*sizeof(float),nullptr,GL_DYNAMIC_STORAGE_BIT);glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER,0,feedback);
+  GLint ssbo=0,ubo=0;integer(GL_SHADER_STORAGE_BUFFER_BINDING,0,&ssbo);integer(GL_UNIFORM_BUFFER_BINDING,0,&ubo);rt_log("graphics-trace: bound SSBO=%d UBO=%d expected=%u",ssbo,ubo,xf_ubo);
+  const std::string head="#version 450 core\nlayout(location=0) in vec3 a_pos;layout(location=10) in uvec4 a_mtx0;\n";
+  std::vector<std::pair<std::string,std::string>> traces={
+   {"simple",simple},
+   {"SSBO-low",head+storage+"\nvoid main(){gl_Position=vec4(a_pos.xy*uintBitsToFloat(XU(0u)),.5,1);}"},
+   {"SSBO-high",head+storage+"\nvoid main(){gl_Position=vec4(a_pos.xy*uintBitsToFloat(XU(0x1020u)),.5,1);}"},
+   {"UBO-high",head+uniform+"\nvoid main(){gl_Position=vec4(a_pos.xy*uintBitsToFloat(XU(0x1020u)),.5,1);}"},
+   {"GX-full",vs},
+   {"GX-full-no-depth-attachment",vs}
+  };
+  bind_vertex_stream(buffers[0]);
+  for(auto& trace:traces){
+   std::string source=trace.second;
+   const bool gx=trace.first.rfind("GX-",0)==0;
+   if(gx){auto pos=source.find("void main()");source.insert(pos,"out vec4 probeXF;out vec4 probeMtx;\n");source.insert(source.rfind('}'),"probeXF=vec4(X(0u),X(0x1020u),float(XU(0x1026u)),X(0x101Fu));probeMtx=vec4(a_mtx0);\n");}
+   Linking linked=link_start(source,red);const char* names[]={"gl_Position","probeXF","probeMtx"};vary(linked.p,gx?3:1,names,GL_INTERLEAVED_ATTRIBS);glLinkProgram(linked.p);GLuint program=link_finish(linked,source,red);
+   if(!program){rt_log("graphics-trace: %s LINK FAIL",trace.first.c_str());continue;}
+   glUseProgram(program);glEnable(GL_RASTERIZER_DISCARD);begin(GL_POINTS);glDrawArrays(GL_POINTS,0,3);end();glDisable(GL_RASTERIZER_DISCARD);
+   float values[36]{};read(feedback,0,sizeof values,values);int stride=gx?12:4;
+   for(int v=0;v<3;++v){const float* a=values+v*stride;rt_log("graphics-trace: %s vertex=%d clip=(%.9g,%.9g,%.9g,%.9g)",trace.first.c_str(),v,a[0],a[1],a[2],a[3]);if(gx)rt_log("graphics-trace: GPU XF=(%.9g,%.9g,%.9g,%.9g) mtx=(%.9g,%.9g,%.9g,%.9g)",a[4],a[5],a[6],a[7],a[8],a[9],a[10],a[11]);}
+   if(trace.first=="GX-full-no-depth-attachment")glNamedFramebufferTexture(efb_fbo,GL_DEPTH_ATTACHMENT,0,0);
+   glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);glViewport(0,0,64,64);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);uint8_t pixel[4]{};glReadPixels(40,24,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);rt_log("graphics-trace: %s pixel=%u,%u,%u,%u error=%04X",trace.first.c_str(),pixel[0],pixel[1],pixel[2],pixel[3],glGetError());
+   glNamedFramebufferTexture(efb_fbo,GL_DEPTH_ATTACHMENT,efb_dep,0);
+   std::string name="trace-"+trace.first+".vert";if(FILE* f=std::fopen(name.c_str(),"wb")){std::fwrite(source.data(),1,source.size(),f);std::fclose(f);}glDeleteProgram(program);
+  }
+ }
+ for(unsigned a=1;a<10;++a)glEnableVertexArrayAttrib(vao,a);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,xf_ubo);glBindBufferBase(GL_UNIFORM_BUFFER,0,xf_ubo);
+ bind_vertex_stream(vbo);glNamedBufferSubData(xf_ubo,0,sizeof xf,xf);PSUniforms zero{};glNamedBufferSubData(ps_ubo,0,sizeof zero,&zero);ps_valid=false;xf_lo=0;xf_hi=0x1058;glUseProgram(0);
+ for(GLuint p:programsTest)if(p)glDeleteProgram(p);
+ // Probe buffers remain alive until context teardown (one stays persistently mapped).
+ glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);glClearColor(0,0,0,1);glDepthMask(GL_TRUE);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+ return ok[0]&&ok[1]&&ok[2]&&ok[4]&&(driver_vertex_upload||ok[3]);
+}
+bool graphics_selftest(){
+ glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);glColorMask(1,1,1,1);glDisable(GL_COLOR_LOGIC_OP);glEnable(GL_SCISSOR_TEST);
+ const int width=EFB_W*S,height=EFB_H*S;
+ const float colors[4][3]={{1,0,0},{0,1,0},{0,0,1},{1,1,0}};
+ for(int i=0;i<4;++i){glScissor((i&1)*width/2,(i>>1)*height/2,width/2,height/2);glClearColor(colors[i][0],colors[i][1],colors[i][2],1);glClear(GL_COLOR_BUFFER_BIT);}
+ glDisable(GL_SCISSOR_TEST);
+ Tex test;ensure_tex(test,64,64,1);glNamedFramebufferTexture(copy_fbo,GL_COLOR_ATTACHMENT0,test.name,0);
+ framebuffer_blit(efb_fbo,copy_fbo,0,0,width,height,0,0,64,64,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+ std::vector<uint8_t> texture(64*64*4);glGetTextureImage(test.name,0,GL_RGBA,GL_UNSIGNED_BYTE,GLsizei(texture.size()),texture.data());
+ bool copied=true,presented=true;
+ for(int i=0;i<4;++i){size_t offset=(size_t((i>>1)*48+8)*64+(i&1)*48+8)*4;
+  for(int c=0;c<3;++c)copied&=std::abs(int(texture[offset+c])-int(colors[i][c]*255))<=2;}
+ glBindFramebuffer(GL_FRAMEBUFFER,0);compatDrawBuffer(GL_BACK);compatReadBuffer(GL_BACK);present_texture(test,0,0,64,64);
+ for(int i=0;i<4;++i){uint8_t pixel[4]{};glReadPixels((i&1)*48+8,(i>>1)*48+8,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+  for(int c=0;c<3;++c)presented&=std::abs(int(pixel[c])-int(colors[i^2][c]*255))<=2;}
+ GLenum error=glGetError();
+ rt_log("graphics: selftest GPU-copy=%s window=%s GLerror=%04X",copied?"PASS":"FAIL",presented?"PASS":"FAIL",error);
+ glNamedFramebufferTexture(copy_fbo,GL_COLOR_ATTACHMENT0,0,0);glDeleteTextures(1,&test.name);
+ glBindFramebuffer(GL_FRAMEBUFFER,efb_fbo);glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glDepthMask(GL_TRUE);glClearColor(0,0,0,1);glClearDepth(1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);glBindVertexArray(vao);
+ return copied&&presented&&error==GL_NO_ERROR;
+}
+void diagnostic_texture(const char* stage,const Tex& t){
+ std::vector<uint8_t> pixels(size_t(t.w)*t.h*4);
+ glGetTextureImage(t.name,0,GL_RGBA,GL_UNSIGNED_BYTE,GLsizei(pixels.size()),pixels.data());
+ size_t lit=0;unsigned maximum=0;
+ for(size_t i=0;i<pixels.size();i+=4){unsigned v=std::max({pixels[i],pixels[i+1],pixels[i+2]});maximum=std::max(maximum,v);lit+=v>8;}
+ char file[128];std::snprintf(file,sizeof(file),"graphics-diagnostics/%06llu_%s.png",(unsigned long long)diagnostic_frame,stage);
+ write_png(file,t.w,t.h,pixels.data());
+ rt_log("graphics: frame=%llu %s %dx%d nonblack=%zu/%zu max=%u",(unsigned long long)diagnostic_frame,stage,t.w,t.h,lit,size_t(t.w)*t.h,maximum);
+ graphics_errors(stage);
+}
+void present() {
+    ++cnt.presents;
+    int ww=0,wh=0;SDL_GetWindowSizeInPixels(win,&ww,&wh);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);compatDrawBuffer(GL_BACK);compatReadBuffer(GL_BACK);
+    glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    auto it=xfbs.find(xfb_addr.load());if(it==xfbs.end())it=xfbs.find(last_xfb);
+    if(it!=xfbs.end()&&ww>0&&wh>0){
+        const Tex& t=it->second;Rect r=picture_rect(float(ww),float(wh));
+        int dx=int(std::lround(r.x)),dy=int(std::lround(r.y)),dw=int(std::lround(r.w)),dh=int(std::lround(r.h));
+        present_texture(t,dx,dy,dw,dh);
+    }
+    const bool capture=graphics_diagnostics&&diagnostic_pending;
+    if(capture){
+        rt_log("graphics: frame=%llu XFB-captured=%08X displayed=%08X",(unsigned long long)diagnostic_frame,diagnostic_xfb,it!=xfbs.end()?it->first:0);
+        GLint samples=0;compatGetInteger(GL_SAMPLES,&samples);
+        rt_log("graphics: backbuffer %dx%d samples=%d EFBstatus=%04X",ww,wh,samples,glCheckNamedFramebufferStatus(efb_fbo,GL_FRAMEBUFFER));
+    }
+    if(((opt.dump_dir&&cnt.presents%(uint64_t)opt.dump_every==0)||capture)&&ww>0&&wh>0){
+        std::vector<uint8_t> px(size_t(ww)*wh*4),flip(px.size());
+        glReadPixels(0,0,ww,wh,GL_RGBA,GL_UNSIGNED_BYTE,px.data());
+        for(int y=0;y<wh;++y)std::memcpy(&flip[size_t(y)*ww*4],&px[size_t(wh-1-y)*ww*4],size_t(ww)*4);
+        char name[128];
+        if(opt.dump_dir&&cnt.presents%(uint64_t)opt.dump_every==0){
+            std::snprintf(name,sizeof(name),"/frame_%06llu.png",(unsigned long long)cnt.presents);
+            write_png(std::string(opt.dump_dir)+name,ww,wh,flip.data());
+        }
+        if(capture){
+            std::snprintf(name,sizeof(name),"graphics-diagnostics/%06llu_window.png",(unsigned long long)diagnostic_frame);
+            write_png(name,ww,wh,flip.data());
+            size_t lit=0;for(size_t i=0;i<px.size();i+=4)lit+=std::max({px[i],px[i+1],px[i+2]})>8;
+            rt_log("graphics: window nonblack=%zu/%zu",lit,size_t(ww)*wh);graphics_errors("window capture");
+        }
+    }
+    if(capture)diagnostic_pending=false;
+    SDL_GL_SwapWindow(win);
+}
+
+void setup() {
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    glDisable(GL_DITHER);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    glCreateTextures(GL_TEXTURE_2D, 1, &efb_col);
+    glTextureStorage2D(efb_col, 1, GL_RGBA8, EFB_W * S, EFB_H * S);
+    glCreateTextures(GL_TEXTURE_2D, 1, &efb_dep);
+    glTextureStorage2D(efb_dep, 1, GL_DEPTH_COMPONENT32F, EFB_W * S, EFB_H * S);
+    for (GLuint t : {efb_col, efb_dep}) {
+        glTextureParameteri(t, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTextureParameteri(t, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glCreateFramebuffers(1, &efb_fbo);
+    glNamedFramebufferTexture(efb_fbo, GL_COLOR_ATTACHMENT0, efb_col, 0);
+    glNamedFramebufferTexture(efb_fbo, GL_DEPTH_ATTACHMENT, efb_dep, 0);
+    if (glCheckNamedFramebufferStatus(efb_fbo, GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        rt_die("video: the EFB framebuffer is incomplete");
+    glCreateFramebuffers(1, &copy_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_fbo);
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glCreateBuffers(1, &vbo);
+    const GLbitfield map=GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT|GL_MAP_COHERENT_BIT;
+    if(const char* mode=std::getenv("STAR_GL_VERTEX_UPLOAD"))driver_vertex_upload=SDL_strcasecmp(mode,"persistent")!=0;
+    glNamedBufferStorage(vbo,VBO_CAP,nullptr,driver_vertex_upload?GL_DYNAMIC_STORAGE_BIT:map);
+    if(!driver_vertex_upload){
+        vbo_ptr=static_cast<uint8_t*>(glMapNamedBufferRange(vbo,0,VBO_CAP,map));
+        if(!vbo_ptr)rt_die("video: the vertex buffer cannot be mapped");
+    }
+    rt_log("graphics: vertex-upload=%s",driver_vertex_upload?"driver-managed":"persistent coherent map");
+    std::vector<uint32_t> qi;
+    for (uint32_t k = 0; k < 0x10000 / 4; ++k)
+        for (uint32_t d : {0u, 1u, 2u, 0u, 2u, 3u}) qi.push_back(4 * k + d);
+    glCreateBuffers(1, &quad_ibo);
+    glNamedBufferStorage(quad_ibo, qi.size() * 4, qi.data(), 0);
+    glCreateVertexArrays(1, &vao);
+    glCreateVertexArrays(1, &empty_vao);
+    bind_vertex_stream(vbo);
+    glVertexArrayElementBuffer(vao, quad_ibo);
+    struct A { GLuint loc; int n; GLenum type; bool norm, integer; size_t off; };
+    const A attrs[] = {{0, 3, GL_FLOAT, false, false, offsetof(GVtx, pos)},
+                       {1, 3, GL_FLOAT, false, false, offsetof(GVtx, nrm)},
+                       {2, 3, GL_FLOAT, false, false, offsetof(GVtx, bin)},
+                       {3, 3, GL_FLOAT, false, false, offsetof(GVtx, tan)},
+                       {4, 4, GL_UNSIGNED_BYTE, true, false, offsetof(GVtx, col)},
+                       {5, 4, GL_UNSIGNED_BYTE, true, false, offsetof(GVtx, col) + 4},
+                       {6, 4, GL_FLOAT, false, false, offsetof(GVtx, tc)},
+                       {7, 4, GL_FLOAT, false, false, offsetof(GVtx, tc) + 16},
+                       {8, 4, GL_FLOAT, false, false, offsetof(GVtx, tc) + 32},
+                       {9, 4, GL_FLOAT, false, false, offsetof(GVtx, tc) + 48},
+                       {10, 4, GL_UNSIGNED_BYTE, false, true, offsetof(GVtx, mtx)},
+                       {11, 4, GL_UNSIGNED_BYTE, false, true, offsetof(GVtx, mtx) + 4},
+                       {12, 4, GL_UNSIGNED_BYTE, false, true, offsetof(GVtx, mtx) + 8}};
+    for (const A& a : attrs) {
+        glEnableVertexArrayAttrib(vao, a.loc);
+        if (a.integer) glVertexArrayAttribIFormat(vao, a.loc, a.n, a.type, 0);
+        else glVertexArrayAttribFormat(vao, a.loc, a.n, a.type, a.norm, 0);
+        glVertexArrayAttribBinding(vao, a.loc, a.loc);
+    }
+    glBindVertexArray(vao);
+    rt_log("graphics: vertex layout=13 independent attribute bindings; matrix offset=%zu",offsetof(GVtx,mtx));
+
+    glCreateBuffers(1, &xf_ubo);
+    glNamedBufferStorage(xf_ubo, sizeof xf, nullptr, GL_DYNAMIC_STORAGE_BIT);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, xf_ubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, xf_ubo); // legacy probe only; PS uses binding 1
+    rt_log("graphics: XF matrices=scalar SSBO (%zu bytes)", sizeof xf);
+    glCreateBuffers(1, &ps_ubo);
+    glNamedBufferStorage(ps_ubo, sizeof(PSUniforms), nullptr, GL_DYNAMIC_STORAGE_BIT);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 1, ps_ubo);
+    glCreateSamplers(8, samplers);
+
+    copy_prog = link(FULLSCREEN_VS, COPY_FS);
+    if (!copy_prog) rt_die("video: the EFB copy program does not build");
+    copy_rect_loc = glGetUniformLocation(copy_prog, "u_rect");
+    copy_mode_loc = glGetUniformLocation(copy_prog, "u_mode");
+}
+
+}  // namespace
+
+// ---- the game's side ------------------------------------------------------------------------------
+bool video_enabled() { return opt.enabled; }
+void video_configure(const VideoOptions& o) {
+ opt=o;S=std::max(1,o.scale);
+ if(std::getenv("STAR_GL_FRESH_SHADERS")){opt.shader_cache.clear();opt.shader_list.clear();opt.shader_lists.clear();}
+ if(FILE* f=std::fopen("star-successor-settings.ini","r")){
+  int w,h,scale,filter,vsync;
+  if(std::fscanf(f,"%d %d %d %d %d",&w,&h,&scale,&filter,&vsync)==5 && w>=640&&w<=3840&&h>=480&&h<=2160&&scale>=1&&scale<=6){opt.window_w=w;opt.window_h=h;S=scale;opt.scale=scale;outputLinear=filter!=0;hostVsync=vsync!=0;}
+  std::fclose(f);
+ }
+ if(const char* p=std::getenv("STAR_TEST_SCALE")){S=std::max(1,std::min(6,std::atoi(p)));opt.scale=S;}
+ if(const char* p=std::getenv("STAR_TEST_WINDOW"))std::sscanf(p,"%dx%d",&opt.window_w,&opt.window_h);
+}
+
+VideoPerf g_vperf;
+bool g_vperf_on = std::getenv("WIIKIT_PERF") != nullptr;
+
+bool video_submit(std::vector<uint8_t>& rec, int frames, int wait_ms) {
+    auto t0 = Clock::now();
+    std::unique_lock<std::mutex> lk(qmx);
+    // frames in flight: each one queued is 33 ms more between what the game
+    // decides and what is seen, and one less the game and the renderer can
+    // work on side by side
+    auto room = [] { return q_frames < opt.frames_ahead && q.size() < 256; };
+    bool ok = true;
+    if (wait_ms < 0) q_space.wait(lk, room);
+    else ok = q_space.wait_for(lk, std::chrono::milliseconds(wait_ms), room);
+    if (g_vperf_on) g_vperf.wait += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+    if (!ok) return false;
+    q.push_back(Chunk{std::move(rec), frames});
+    q_frames += frames;
+    // a buffer the renderer is done with, capacity and pages kept: fresh
+    // allocations of megabytes a frame cost page faults and copies as they grow
+    if (!spare.empty()) {
+        rec = std::move(spare.back());
+        spare.pop_back();
+    } else {
+        rec = std::vector<uint8_t>();
+        rec.reserve(2u << 20);
+    }
+    lk.unlock();
+    if (wake) SDL_SignalSemaphore(wake);
+    return true;
+}
+
+bool video_efb_read(std::vector<uint32_t>& argb, std::vector<uint32_t>& z) {
+    if (!opt.enabled) return false;
+    std::unique_lock<std::mutex> lk(rb_mx);
+    rb_argb = &argb;
+    rb_z = &z;
+    rb_ready = false;
+    {
+        std::lock_guard<std::mutex> ql(qmx);
+        q.push_back(Chunk{{}, 0, true});
+    }
+    if (wake) SDL_SignalSemaphore(wake);
+    // the console's CPU takes its interrupts while it waits: so does this wait
+    while (!rb_ready) {
+        rb_cv.wait_for(lk, std::chrono::milliseconds(1));
+        if (!rb_ready && t_ppc && g_ppc_pending.load(std::memory_order_relaxed)) {
+            lk.unlock();
+            ppc_poll(*t_ppc);
+            lk.lock();
+        }
+    }
+    return true;
+}
+
+bool video_copy_read(uint32_t addr, int w, int h, std::vector<uint8_t>& rgba) {
+    if (!opt.enabled) return false;
+    std::unique_lock<std::mutex> lk(rb_mx);
+    rb_rgba = &rgba;
+    rb_w = w;
+    rb_h = h;
+    rb_ready = false;
+    {
+        std::lock_guard<std::mutex> ql(qmx);
+        q.push_back(Chunk{{}, 0, true, addr});
+    }
+    if (wake) SDL_SignalSemaphore(wake);
+    while (!rb_ready) {                              // taking interrupts meanwhile, as video_efb_read
+        rb_cv.wait_for(lk, std::chrono::milliseconds(1));
+        if (!rb_ready && t_ppc && g_ppc_pending.load(std::memory_order_relaxed)) {
+            lk.unlock();
+            ppc_poll(*t_ppc);
+            lk.lock();
+        }
+    }
+    return true;
+}
+
+void video_set_xfb(uint32_t a) { xfb_addr.store(a); }
+void video_set_lines(uint32_t n) { vi_lines.store(n); }
+std::atomic<bool> want_relative{false};
+std::mutex motion_mx;
+float motion_x = 0, motion_y = 0;
+void video_set_relative_mouse(bool on) { want_relative = on; }
+void video_take_mouse_motion(float& dx, float& dy) {
+    std::lock_guard<std::mutex> lk(motion_mx);
+    dx = motion_x; dy = motion_y;
+    motion_x = motion_y = 0;
+}
+
+PadState video_pad() {
+    std::lock_guard<std::mutex> lk(pad_mx);
+    PadState sample=pad;
+    sample.buttons |= pending_buttons.exchange(0, std::memory_order_relaxed);
+    return sample;
+}
+ClassicState video_classic(int chan) {
+    std::lock_guard<std::mutex> lk(pad_mx);
+    return chan >= 0 && chan < 4 ? classic[chan] : ClassicState{};
+}
+void video_set_rumble(int chan, bool on) {
+    if (chan >= 0 && chan < 4) rumble_want[chan] = on;
+}
+void video_retrace() {
+    retraces.fetch_add(1);
+    if (wake) SDL_SignalSemaphore(wake);
+}
+
+// ---- the window --------------------------------------------------------------------------------
+void video_run(const char* title) {
+    rt_log("graphics-startup: SDL_Init begin");
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) rt_die("video: SDL_Init: %s", SDL_GetError());
+    rt_log("graphics-startup: SDL_Init complete; GL library hint=%s",SDL_GetHint(SDL_HINT_OPENGL_LIBRARY)?SDL_GetHint(SDL_HINT_OPENGL_LIBRARY):"system");
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    bool debug = std::getenv("WIIKIT_GLDEBUG") != nullptr;
+    if (debug) SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+    // 720 lines at the screen's shape unless --window says otherwise;
+    // fullscreen is SDL's borderless one at the desktop's mode: the other
+    // windows stay, and the picture keeps its shape with bars at the sides
+    int w0 = opt.window_w ? opt.window_w : (opt.widescreen ? 1280 : 960), h0 = opt.window_h ? opt.window_h : 720;
+    SDL_WindowFlags wflags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+    if (opt.fullscreen) wflags |= SDL_WINDOW_FULLSCREEN;
+    rt_log("graphics-startup: SDL_CreateWindow begin");
+    win = SDL_CreateWindow(title, w0, h0, wflags);
+    rt_log("graphics-startup: SDL_CreateWindow returned %s",win?"OK":SDL_GetError());
+    if (!win) rt_die("video: SDL_CreateWindow: %s", SDL_GetError());
+    rt_log("graphics-startup: SDL_GL_CreateContext begin");
+    SDL_GLContext ctx = SDL_GL_CreateContext(win);
+    rt_log("graphics-startup: SDL_GL_CreateContext returned %s",ctx?"OK":SDL_GetError());
+    if (!ctx) rt_die("video: no OpenGL 4.5 context: %s", SDL_GetError());
+    if(!SDL_GL_MakeCurrent(win,ctx))rt_die("video: make-current failed: %s",SDL_GetError());
+    rt_log("graphics-startup: context current");
+    SDL_GL_SetSwapInterval(hostVsync?1:0);                   // VI paces the presents
+    if (!gl_load()) rt_die("video: OpenGL functions missing");
+    compatGetInteger=reinterpret_cast<PFNGLGETINTEGERVPROC>(SDL_GL_GetProcAddress("glGetIntegerv"));
+    compatBlit=reinterpret_cast<PFNGLBLITFRAMEBUFFERPROC>(SDL_GL_GetProcAddress("glBlitFramebuffer"));
+    compatDrawBuffer=reinterpret_cast<PFNGLDRAWBUFFERPROC>(SDL_GL_GetProcAddress("glDrawBuffer"));
+    compatReadBuffer=reinterpret_cast<PFNGLREADBUFFERPROC>(SDL_GL_GetProcAddress("glReadBuffer"));
+    if(!compatGetInteger||!compatBlit||!compatDrawBuffer||!compatReadBuffer)rt_die("video: framebuffer compatibility functions missing");
+    rt_log("video: %s, %s", (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
+    if(std::getenv("STAR_REQUIRE_VULKAN_GPU")){
+        const char* renderer=reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        bool zink=renderer&&SDL_strcasestr(renderer,"zink");
+        bool software=!renderer||SDL_strcasestr(renderer,"llvmpipe")||SDL_strcasestr(renderer,"lavapipe")||SDL_strcasestr(renderer,"softpipe")||SDL_strcasestr(renderer,"SwiftShader")||SDL_strcasestr(renderer,"Microsoft Basic Render");
+        if(!zink||software){
+            rt_log("graphics: requested Vulkan GPU unavailable; renderer=%s",renderer?renderer:"none");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Star Successor - Vulkan","O modo Vulkan nao encontrou uma GPU compativel. Consulte o log de diagnostico.",win);
+            rt_die("video: refusing non-Vulkan or CPU rendering for Vulkan GPU mode");
+        }
+        rt_log("graphics: Vulkan via Zink confirmed on GPU");
+    }
+    if(graphics_diagnostics){
+        GLint block=0,attributes=0;compatGetInteger(GL_MAX_UNIFORM_BLOCK_SIZE,&block);compatGetInteger(GL_MAX_VERTEX_ATTRIBS,&attributes);
+        rt_log("graphics: uniform-block-limit=%d XF-bytes=%zu PS-bytes=%zu vertex-attributes=%d GVtx-bytes=%zu",block,sizeof xf,sizeof(PSUniforms),attributes,sizeof(GVtx));
+    }
+    if (debug) {
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glDebugMessageCallback(gl_debug, nullptr);
+    }
+    wake = SDL_CreateSemaphore(0);
+    load_keys(opt.keys.empty() ? std::string("keys.txt") : opt.keys);
+    if (opt.scale <= 0) {
+        // enough EFB lines for the screen's height at the window's first
+        // size: 3 for 1080 or 1440 lines, 2 for 720
+        int ww = 0, wh = 0;
+        SDL_GetWindowSizeInPixels(win, &ww, &wh);
+        float aspect = opt.widescreen ? 16.0f / 9 : 4.0f / 3;
+        float sh = std::min((float)wh, (float)ww / aspect);
+        S = std::clamp((int)std::ceil(sh / 480 - 0.01f), 1, 4);
+    }
+    rt_log("video: internal resolution x%d (EFB %d x %d)", S, EFB_W * S, EFB_H * S);
+    setup();
+    present_prog=link(R"(#version 450 core
+out vec2 uv;
+void main(){vec2 q=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=q;gl_Position=vec4(q*2.0-1.0,0.0,1.0);}
+)",R"(#version 450 core
+layout(binding=0) uniform sampler2D image;
+in vec2 uv;layout(location=0) out vec4 color;
+void main(){color=texture(image,vec2(uv.x,1.0-uv.y));}
+)");
+    if(!present_prog)rt_die("video: GPU presentation shader failed");
+    glCreateSamplers(1,&present_sampler);
+    glSamplerParameteri(present_sampler,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glSamplerParameteri(present_sampler,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    rt_log("graphics: presentation=%s copies=%s",std::getenv("STAR_PRESENT_BLIT")?"blit":"GPU textured triangle",std::getenv("STAR_GL_NAMED_BLIT")?"named":"bound framebuffers");
+    if(graphics_diagnostics)std::filesystem::create_directories("graphics-diagnostics");
+    graphics_errors("setup");
+    if(const char* test=std::getenv("STAR_GL_SELFTEST")){
+        bool passed=std::getenv("STAR_GL_PROBE_SKIP_COPY")?true:graphics_selftest();passed=geometry_selftest()&&passed;
+        if(std::strcmp(test,"only")==0)std::exit(passed?0:24);
+    }
+    warm_start();
+    rt_log("graphics-startup: render loop ready");
+
+    auto t0 = Clock::now(), t_title = t0;
+    uint64_t frames_then = 0;
+    uint32_t seen = retraces.load();
+    std::string base_title = title;
+    for (;;) {
+        SDL_Event e;
+        bool quit = false;
+        while (SDL_PollEvent(&e)) {
+            // Keep a short click until the guest actually samples its controller.
+            if ((e.type==SDL_EVENT_KEY_DOWN && !e.key.repeat && !(e.key.mod&SDL_KMOD_ALT)) || e.type==SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                uint32_t bits=0;
+                for(const Binding& binding:bindings) {
+                    if(binding.classic || binding.drag)continue;
+                    bool hit=e.type==SDL_EVENT_KEY_DOWN ? !binding.mouse && binding.key==e.key.scancode : binding.mouse && (binding.mouse&SDL_BUTTON_MASK(e.button.button));
+                    if(hit)bits |= binding.bits&0xFFFFu;
+                }
+                pending_buttons.fetch_or(bits,std::memory_order_relaxed);
+            }
+            if (e.type == SDL_EVENT_QUIT) quit = true;
+            if (e.type == SDL_EVENT_GAMEPAD_ADDED) pad_added(e.gdevice.which);
+            if (e.type == SDL_EVENT_GAMEPAD_REMOVED) pad_removed(e.gdevice.which);
+            // F11 or Alt+Enter: fullscreen and back
+            if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
+                (e.key.scancode == SDL_SCANCODE_F11 ||
+                 ((e.key.scancode == SDL_SCANCODE_RETURN || e.key.scancode == SDL_SCANCODE_KP_ENTER) &&
+                  (e.key.mod & SDL_KMOD_ALT))))
+                SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+            // F12: the next frame's GX commands to a file (debugging, as WIIKIT_GXTRACE)
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat)
+                gx_trace_next_frame();
+            // Esc: the port's menu in place of the Wii's Home Button menu.
+            // While it is open the renderer stops, and the game with it as
+            // soon as its FIFO record queue is full.
+            if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE && !e.key.repeat) {
+                if(port_menu())quit=true;
+            }
+        }
+        auto now = Clock::now();
+        if (opt.quit_after > 0 && std::chrono::duration<double>(now - t0).count() > opt.quit_after) quit = true;
+        if (quit) {
+            rt_log("video: %llu frames, %llu presents, %llu draws, %llu programs (%llu linked, %llu from the shader cache)",
+                   (unsigned long long)cnt.frames, (unsigned long long)cnt.presents,
+                   (unsigned long long)cnt.draws, (unsigned long long)cnt.programs,
+                   (unsigned long long)cnt.linked, (unsigned long long)cnt.cached);
+            gx_report();
+            std::fflush(stdout);
+            std::_Exit(0);
+        }
+        update_pad();
+        {
+            bool rel = want_relative && (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS);
+            if (rel != SDL_GetWindowRelativeMouseMode(win)) SDL_SetWindowRelativeMouseMode(win, rel);
+            float dx = 0, dy = 0;
+            SDL_GetRelativeMouseState(&dx, &dy);
+            if (rel) {
+                std::lock_guard<std::mutex> lk(motion_mx);
+                motion_x += dx; motion_y += dy;
+            }
+        }
+        if (now - t_title >= std::chrono::seconds(1)) {
+            double s = std::chrono::duration<double>(now - t_title).count();
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "%s  |  %.1f fps", base_title.c_str(), (double)(cnt.frames - frames_then) / s);
+            SDL_SetWindowTitle(win, buf);
+            if (g_vperf_on && cnt.frames > frames_then) {
+                double f = (double)(cnt.frames - frames_then);
+                auto ms = [&](std::atomic<uint64_t>& a) { return (double)a.exchange(0) / 1e6 / f; };
+                double vtx = ms(g_vperf.vtx), tex = ms(g_vperf.tex), wait = ms(g_vperf.wait), draw = ms(g_vperf.draw),
+                       pres = ms(g_vperf.present);
+                rt_log("perf: %.1f fps; frame %.1f ms; game thread: vertices %.1f, textures %.1f, waiting for the renderer %.1f; "
+                       "renderer %.1f, presenting %.1f ms", f / s, 1000.0 * s / f, vtx, tex, wait, draw, pres);
+            }
+            frames_then = cnt.frames;
+            t_title = now;
+        }
+        warm_poll();
+        bool busy = false;
+        for (int k = 0; k < 16; ++k) {
+            Chunk c;
+            {
+                std::lock_guard<std::mutex> lk(qmx);
+                if (q.empty()) break;
+                c = std::move(q.front());
+                q.pop_front();
+            }
+            if (c.readback) { if (c.copy) copy_readback(c.copy); else efb_readback(); busy = true; continue; }
+            auto te = Clock::now();
+            exec(c.data);
+            if (g_vperf_on) g_vperf.draw += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - te).count();
+            {
+                std::lock_guard<std::mutex> lk(qmx);
+                q_frames -= c.frames;
+                c.data.clear();
+                if (spare.size() < 16) spare.push_back(std::move(c.data));
+            }
+            q_space.notify_all();
+            busy = true;
+            if (retraces.load() != seen) break;
+        }
+        uint32_t r = retraces.load();
+        if (r != seen) {
+            seen = r;
+            auto tp = Clock::now();
+            present();
+            if (g_vperf_on) g_vperf.present += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - tp).count();
+            busy = true;
+        }
+        if (!busy) SDL_WaitSemaphoreTimeout(wake, 5);
+    }
+}

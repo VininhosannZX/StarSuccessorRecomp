@@ -1,0 +1,939 @@
+{
+  "format": "wiicompiled-runtime-native-index",
+  "formatVersion": 2,
+  "extractorVersion": 2,
+  "sourceDigest": "90ee512aafe2cb98f410a8ac208436e5ec505ca576f04a66eb742aa8fbe1d22a",
+  "registrations": [
+    {
+      "address": "0x8019DE10",
+      "symbol": "Star_KPADRead",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x8019DE20",
+      "symbol": "Star_KPADReadEx",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x8019E550",
+      "symbol": "Star_KPADInit",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x8019E560",
+      "symbol": "Star_KPADInitEx",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x8019EB60",
+      "symbol": "Star_KPADEnableDPD",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x8019EB80",
+      "symbol": "Star_KPADDisableDPD",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801A8800",
+      "symbol": "Star_OSSaveContext",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801A8880",
+      "symbol": "Star_OSLoadContext",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801ACAF0",
+      "symbol": "Star_OSDisableInterrupts",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801ACB10",
+      "symbol": "Star_OSEnableInterrupts",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801ACB30",
+      "symbol": "Star_OSRestoreInterrupts",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801B0CC0",
+      "symbol": "Star_OSGetTime",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C0C10",
+      "symbol": "Star_WPADInit",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C0CB0",
+      "symbol": "Star_WPADRegisterAllocator",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C0CC0",
+      "symbol": "Star_WPADGetStatus",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C0CD0",
+      "symbol": "Star_WPADGetRadioSensitivity",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C0D20",
+      "symbol": "Star_WPADGetSpeakerVolume",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2020",
+      "symbol": "Star_WPADProbe",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C20B0",
+      "symbol": "Star_WPADSetSamplingCallback",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2140",
+      "symbol": "Star_WPADSetConnectCallback",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C21D0",
+      "symbol": "Star_WPADSetExtensionCallback",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2230",
+      "symbol": "Star_WPADGetDataFormat",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2280",
+      "symbol": "Star_WPADSetDataFormat",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C25C0",
+      "symbol": "Star_WPADControlMotor",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2690",
+      "symbol": "Star_WPADEnableMotor",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C26D0",
+      "symbol": "Star_WPADIsMotorEnabled",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2900",
+      "symbol": "Star_WPADSaveConfig",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C29B0",
+      "symbol": "Star_WPADRead",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C2AA0",
+      "symbol": "Star_WPADSetAutoSamplingBuf",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C4970",
+      "symbol": "Star_WPADGetDpdSensitivity",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C49B0",
+      "symbol": "Star_WPADIsDpdEnabled",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    },
+    {
+      "address": "0x801C6530",
+      "symbol": "Star_WPADSetCallbackByKPAD",
+      "sourceFile": "star_native.cpp",
+      "isTranslatedOverride": false,
+      "excludesBaseTranslation": true,
+      "modOverlay": "Unspecified"
+    }
+  ],
+  "voidStubAbis": [],
+  "effects": [
+    {
+      "address": "0x8019DE10",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x8019DE20",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x8019E550",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x8019E560",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x8019EB60",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x8019EB80",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801A8800",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801A8880",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801ACAF0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801ACB10",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801ACB30",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801B0CC0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C0C10",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C0CB0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C0CC0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C0CD0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C0D20",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2020",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C20B0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2140",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C21D0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2230",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2280",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C25C0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2690",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C26D0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2900",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C29B0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C2AA0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C4970",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C49B0",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    },
+    {
+      "address": "0x801C6530",
+      "isPrecise": false,
+      "contract": {
+        "gprReadBeforeWriteMask": 4294967295,
+        "gprPossibleWriteMask": 4294967295,
+        "gprReturnMask": 24,
+        "fprReadBeforeWriteMask": 4294967295,
+        "fprPossibleWriteMask": 4294967295,
+        "fprReturnMask": 2,
+        "crReadBeforeWriteMask": 255,
+        "crPossibleWriteMask": 255,
+        "readsXerBeforeWrite": true,
+        "mayWriteXer": true,
+        "readsCtrBeforeWrite": true,
+        "mayWriteCtr": true,
+        "readsLrBeforeWrite": true,
+        "mayWriteLr": true,
+        "boundaryFlags": 1
+      }
+    }
+  ]
+}

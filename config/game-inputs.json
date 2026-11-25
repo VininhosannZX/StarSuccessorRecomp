@@ -1,0 +1,17 @@
+{
+  "game_id": "R2VE01",
+  "region": "USA",
+  "purpose": "Input identity checks; these are not game payloads",
+  "files": {
+    "sys/main.dol": "2c750625d647608d9f3f48d75bb45c2f357de44689a167c8074f5ace1054da60",
+    "files/gs2.sel": "75e33b651ec7b569b0dfcce13ed9694c1c23f3e3dced1a5a70e7864434381e1e",
+    "files/stg00.rso": "009041ef511a086ba8374be56f473c96f055c97b1cf66320e3c5d1d408bc2b76",
+    "files/stg01.rso": "465eae042d9472b00be9d1e436d668efed80dedbe2c46f5a09f6e498bf0549c2",
+    "files/stg02.rso": "2dba55df854900cf46b94c00220d7e0b03e1adeda9a6fad3772e6cc47150e0cd",
+    "files/stg03.rso": "b8fcb7660b566e1451a9b02d652e3d7763655e2446846d2c2cd58c2e08290dfe",
+    "files/stg04.rso": "03ce28c4ede4981e4f5af8b1ebf9be208f27339249af7456c7b40421075a6975",
+    "files/stg05.rso": "b8ce258de11add6dd1674e75bd7dedeef2aa9c6931a37182e5b92f6a502c5d27",
+    "files/stg06.rso": "98efe15912c59d7af2bbc4f39eb075ca9abf7a6ddfc9fc14b6eb6694ae2601be",
+    "files/stg07.rso": "d22f7c63c9dae7d4f9865e191a2a8d8507161a0ecca043363af47f80e5b51f3f"
+  }
+}

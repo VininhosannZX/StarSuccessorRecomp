@@ -1,0 +1,64 @@
+{
+  "milestone": "v20",
+  "suggested_git_tag": "v0.1.0-v20",
+  "status": "experimental first-stage milestone",
+  "upstream": {
+    "repository": "https://github.com/patchzyy/Wiicompiled",
+    "commit": "64453f161a1af09ea680373846c3fda8c00cabe4"
+  },
+  "archived_build": {
+    "executable_sha256": "85fe901ee526ba4d57e96c95a37c534513c2096bf34633a5b05231a0750f120e",
+    "guest_optimization": "O1",
+    "runtime_optimization": "O2",
+    "sdl_static": true,
+    "zstd_static": true,
+    "windows_runtime_verified": false,
+    "fps60_verified": false,
+    "revision": "v20-independent-vertex-bindings",
+    "translated_functions": 32352,
+    "required_rso_references": 13731,
+    "missing_required_rso_references": 0,
+    "large_functions_linked": [
+      "818A646C",
+      "8199C5FC",
+      "81A1AE98",
+      "81ACA7C0",
+      "81AE38A0",
+      "81BEB9D4",
+      "81E904D4"
+    ],
+    "native_first_stage_regression": "passed; exit0; score1213",
+    "rso_lifecycle_cases": 32,
+    "rso_boundary_rejections": 16,
+    "diagnostic_executable_sha256": "639188d52d79def1ae5d578fb0c7e84cc9e04be1ea78f234ca4f10c83aa6a503",
+    "diagnostic_guest_optimization": "O0; same O2 graphics/runtime"
+  },
+  "validation": {
+    "source": "owner report in this conversation",
+    "rendering": "working on the owner dedicated-GPU PC",
+    "scope": "first stage only; no complete-game validation",
+    "audio": "not 100% correct",
+    "stable_60_fps_verified": false,
+    "integrated_intel_supported": false,
+    "archived_build_note": "Original BUILD.json is preserved unchanged; its Windows verification flag predates the owner report. No dedicated-PC FPS/driver log was supplied."
+  },
+  "test_pc": {
+    "cpu": "AMD Ryzen 5 5600",
+    "gpu": "AMD Radeon RX 6750 XT",
+    "ram": "16 GB DDR4",
+    "os": "Windows 11",
+    "gpu_driver": "not provided",
+    "resolution": "not recorded",
+    "measured_fps": "not recorded"
+  },
+  "archive_sha256": {
+    "StarSuccessor_Native_Windows_Test_v20.zip": "f0b90f81c564a6f974ed5fe778ec113f5b156331202f1dda3ac5da454e056d83",
+    "StarSuccessor_NativePort_WorkingSources_v20.zip": "c830fcf4e2f42f868d77056c0b1883ef413641d2636d3a8a000546a86bf4cc7d"
+  },
+  "renderer_sha256": {
+    "video.cpp": "b7360f0a9b6d8c5101154de60f0f9f0be62e076a8d75f54caecf390e103d6122",
+    "gxshader.cpp": "71a8c78f9e0b2a462e6d609ab3850b167b99f7eeac50d59d06ab02f6af038068",
+    "video.h": "e517f3757f5d8774788f25953b935f4fcb094f0b0b5e70661f7419e12956b2e3"
+  },
+  "packaging_note": "Public tree contains v20 rendering sources plus repository/bootstrap documentation; no v21/v22 rendering changes. Generated game functions and binaries are intentionally omitted."
+}
