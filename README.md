@@ -2,7 +2,7 @@
 
 # Star Successor Recompiled
 
-### v0.2 · Experimental Windows x64 release based on the v20 milestone
+### v0.3 · Launcher experimental Windows x64 release based on the v20 milestone
 
 An unofficial native PC port of **Sin and Punishment: Star Successor**, using the **Wiicompiled** static translator and a **wiikit-derived** runtime for graphics, audio, input and Wii services.
 
